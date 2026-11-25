@@ -1,0 +1,139 @@
+#!/usr/share/klippy-env/bin/python -B
+"""SPS-aligned H.264 Unix socket reader for go2rtc on Creality K2 Plus."""
+
+import ctypes
+import os
+import signal
+import socket
+import subprocess
+import sys
+
+SOCKET_PATH = "/var/run/h264_uds"
+SPS_PREFIX = b"\x00\x00\x00\x01\x67"
+PR_SET_PDEATHSIG = 1
+
+
+def _set_pdeathsig():
+    try:
+        libc = ctypes.CDLL("libc.so.6")
+        libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
+    except Exception:
+        pass
+
+
+def stream_sps_aligned(write_fd, socket_path=SOCKET_PATH):
+    """Connect to cam_app H.264 UDS, drop leading P-frames until first SPS, and forward Annex-B."""
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(5.0)
+    sock.connect(socket_path)
+    synced = False
+    tail = b""
+    try:
+        while True:
+            data = sock.recv(65536)
+            if not data:
+                break
+            if not synced:
+                buf = tail + data
+                idx = buf.find(SPS_PREFIX)
+                if idx == -1:
+                    tail = buf[-4:]
+                    continue
+                synced = True
+                data = buf[idx:]
+                tail = b""
+            view = memoryview(data)
+            while view:
+                n = os.write(write_fd, view)
+                if n <= 0:
+                    return
+                view = view[n:]
+    finally:
+        sock.close()
+
+
+def _run_mjpeg():
+    proc = subprocess.Popen(
+        [
+            "/usr/bin/ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-fflags",
+            "nobuffer",
+            "-flags",
+            "low_delay",
+            "-analyzeduration",
+            "200000",
+            "-probesize",
+            "65536",
+            "-f",
+            "h264",
+            "-i",
+            "pipe:0",
+            "-an",
+            "-c:v",
+            "mjpeg",
+            "-q:v",
+            "6",
+            "-r",
+            "10",
+            "-f",
+            "mjpeg",
+            "-",
+        ],
+        stdin=subprocess.PIPE,
+        stdout=sys.stdout,
+        stderr=subprocess.DEVNULL,
+        preexec_fn=_set_pdeathsig,
+    )
+
+    def _terminate(_signum, _frame):
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, _terminate)
+    signal.signal(signal.SIGINT, _terminate)
+
+    try:
+        stream_sps_aligned(proc.stdin.fileno())
+    except (BrokenPipeError, OSError, SystemExit):
+        pass
+    finally:
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=2.0)
+            except Exception:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=1.0)
+                except Exception:
+                    pass
+
+
+def main():
+    mode = sys.argv[1] if len(sys.argv) > 1 else "h264"
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    if mode == "h264":
+        try:
+            stream_sps_aligned(sys.stdout.fileno())
+        except (BrokenPipeError, OSError):
+            pass
+    elif mode == "mjpeg":
+        _run_mjpeg()
+    else:
+        sys.stderr.write("Usage: k2_h264_source [h264|mjpeg]\n")
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

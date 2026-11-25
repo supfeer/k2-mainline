@@ -1,0 +1,276 @@
+#!/bin/sh
+set -eu
+
+TARGET_VERSION="@TARGET_VERSION@"
+
+fail() {
+    printf '%s\n' "K2 mainline postinstall: $*" >&2
+    exit 1
+}
+
+[ -n "$TARGET_VERSION" ] || fail 'Missing TARGET_VERSION'
+case "$TARGET_VERSION" in
+    *@*) fail "Unrendered TARGET_VERSION placeholder: $TARGET_VERSION" ;;
+esac
+
+selection=${1:-}
+case "$selection" in
+    now_A_next_B)
+        prev_boot=bootA
+        prev_root=rootfsA
+        target_boot=bootB
+        target_root=rootfsB
+        ;;
+    now_B_next_A)
+        prev_boot=bootB
+        prev_root=rootfsB
+        target_boot=bootA
+        target_root=rootfsA
+        ;;
+    *) fail "Invalid slot selection in postinstall: ${selection:-unset}" ;;
+esac
+
+# Phase A: Read-only audit of active slot metadata and /overlay/upper before any mutation.
+prev_ver=$(fw_printenv -n version 2>/dev/null || true)
+cur_boot=$(fw_printenv -n boot_partition 2>/dev/null || true)
+cur_root=$(fw_printenv -n root_partition 2>/dev/null || true)
+[ "$cur_boot" = "$prev_boot" ] || fail "Unexpected active boot_partition: $cur_boot != $prev_boot"
+[ "$cur_root" = "$prev_root" ] || fail "Unexpected active root_partition: $cur_root != $prev_root"
+
+for parent in \
+    etc \
+    etc/go2rtc \
+    etc/init.d \
+    etc/nginx \
+    etc/rc.d \
+    usr \
+    usr/bin \
+    usr/share \
+    usr/share/klipper \
+    usr/share/klipper/klippy \
+    usr/share/klipper/fw \
+    usr/share/klipper/fw/F008 \
+    usr/share/klipper/config \
+    usr/share/klipper/config/F008_CR0CN240319C13 \
+    usr/share/moonraker \
+    usr/share/moonraker-env \
+    usr/share/moonraker-env/lib \
+    usr/share/moonraker-env/lib/python3.9 \
+    usr/share/fluidd \
+    usr/share/mainsail \
+    usr/share/k2-ota
+do
+    ov_path="/overlay/upper/$parent"
+    [ ! -L "$ov_path" ] || fail "Symlink in overlay parent path: $parent"
+    if [ -e "$ov_path" ] && [ ! -d "$ov_path" ]; then
+        fail "Expected directory in overlay path: $parent"
+    fi
+done
+
+for item in \
+    etc/go2rtc/go2rtc.yaml \
+    etc/init.d/go2rtc \
+    etc/init.d/klipper \
+    etc/init.d/klipper_mcu \
+    etc/init.d/mcu_update \
+    etc/init.d/moonraker \
+    etc/nginx/nginx.conf \
+    etc/rc.d/S98go2rtc \
+    usr/bin/klipper_mcu \
+    usr/bin/curl \
+    usr/bin/go2rtc \
+    usr/bin/k2_h264_source \
+    usr/share/klipper/config/k2_sync_config.py
+do
+    shadow="/overlay/upper/$item"
+    [ ! -d "$shadow" ] || fail "Refusing to unlink directory at file shadow: $item"
+done
+
+for tree in \
+    etc/go2rtc \
+    usr/share/klipper/klippy \
+    usr/share/klipper/fw/F008 \
+    usr/share/klipper/config/F008_CR0CN240319C13 \
+    usr/share/moonraker \
+    usr/share/moonraker-env/lib/python3.9/site-packages \
+    usr/share/fluidd \
+    usr/share/mainsail \
+    usr/share/k2-ota
+do
+    shadow_dir="/overlay/upper/$tree"
+    [ ! -L "$shadow_dir" ] || fail "Refusing to remove symlinked overlay tree: $tree"
+done
+
+# Phase B: Reversibly stage allowlisted /overlay/upper shadows BEFORE committing U-Boot env.
+stage_ov=""
+if [ -d /overlay/upper ]; then
+    stage_ov=$(mktemp -d /overlay/.k2-ota-stage.XXXXXX)
+    : > "$stage_ov/.manifest"
+fi
+
+restore_overlay_stage() {
+    [ -n "$stage_ov" ] || return 0
+    [ -d "$stage_ov" ] || return 0
+    if [ -s "$stage_ov/.manifest" ]; then
+        awk '{lines[NR]=$0} END {for (i=NR; i>=1; i--) if (length(lines[i])>0) print lines[i]}' "$stage_ov/.manifest" > "$stage_ov/.rev" || return 1
+        while IFS='|' read -r orig_rel stage_sub; do
+            [ -n "$orig_rel" ] || continue
+            src="$stage_ov/$stage_sub"
+            dst="/overlay/upper/$orig_rel"
+            mkdir -p "$(dirname "$dst")" || return 1
+            mv "$src" "$dst" || return 1
+        done < "$stage_ov/.rev"
+    fi
+    rm -rf "$stage_ov" || return 1
+    sync
+    return 0
+}
+
+stage_idx=0
+for item in \
+    etc/go2rtc/go2rtc.yaml \
+    etc/init.d/go2rtc \
+    etc/init.d/klipper \
+    etc/init.d/klipper_mcu \
+    etc/init.d/mcu_update \
+    etc/init.d/moonraker \
+    etc/nginx/nginx.conf \
+    etc/rc.d/S98go2rtc \
+    usr/bin/klipper_mcu \
+    usr/bin/curl \
+    usr/bin/go2rtc \
+    usr/bin/k2_h264_source \
+    usr/share/klipper/config/k2_sync_config.py
+do
+    shadow="/overlay/upper/$item"
+    if [ -e "$shadow" ] || [ -L "$shadow" ] || [ -c "$shadow" ]; then
+        [ ! -d "$shadow" ] || {
+            restore_overlay_stage || printf 'CRITICAL: overlay stage restore failed after dir shadow check (%s)\n' "$stage_ov" >&2
+            fail "Refusing to unlink directory at file shadow: $item"
+        }
+        stage_idx=$((stage_idx + 1))
+        mkdir -p "$stage_ov/items" || {
+            restore_overlay_stage || printf 'CRITICAL: overlay stage restore failed (%s)\n' "$stage_ov" >&2
+            fail "Failed to prepare overlay stage for $item"
+        }
+        if ! mv "$shadow" "$stage_ov/items/$stage_idx"; then
+            restore_overlay_stage || printf 'CRITICAL: overlay stage restore failed after mv error (%s)\n' "$stage_ov" >&2
+            fail "Failed to stage overlay shadow $item; U-Boot environment left untouched"
+        fi
+        printf '%s|%s\n' "$item" "items/$stage_idx" >> "$stage_ov/.manifest"
+    fi
+done
+
+for tree in \
+    etc/go2rtc \
+    usr/share/klipper/klippy \
+    usr/share/klipper/fw/F008 \
+    usr/share/klipper/config/F008_CR0CN240319C13 \
+    usr/share/moonraker \
+    usr/share/moonraker-env/lib/python3.9/site-packages \
+    usr/share/fluidd \
+    usr/share/mainsail \
+    usr/share/k2-ota
+do
+    shadow_dir="/overlay/upper/$tree"
+    [ ! -L "$shadow_dir" ] || {
+        restore_overlay_stage || printf 'CRITICAL: overlay stage restore failed after symlink check (%s)\n' "$stage_ov" >&2
+        fail "Refusing to remove symlinked overlay tree: $tree"
+    }
+    if [ -d "$shadow_dir" ] || [ -e "$shadow_dir" ] || [ -c "$shadow_dir" ]; then
+        stage_idx=$((stage_idx + 1))
+        mkdir -p "$stage_ov/items" || {
+            restore_overlay_stage || printf 'CRITICAL: overlay stage restore failed (%s)\n' "$stage_ov" >&2
+            fail "Failed to prepare overlay stage for $tree"
+        }
+        if ! mv "$shadow_dir" "$stage_ov/items/$stage_idx"; then
+            restore_overlay_stage || printf 'CRITICAL: overlay stage restore failed after mv error (%s)\n' "$stage_ov" >&2
+            fail "Failed to stage overlay tree $tree; U-Boot environment left untouched"
+        fi
+        printf '%s|%s\n' "$tree" "items/$stage_idx" >> "$stage_ov/.manifest"
+    fi
+done
+sync
+
+# Phase C: Atomically commit and verify U-Boot slot env; revert on commit/readback failure before cleanup.
+mkdir -p /var/lock
+env_file=$(mktemp /tmp/k2-bootenv.XXXXXX)
+{
+    printf '%s\n' 'swu_mode'
+    printf 'boot_partition %s\n' "$target_boot"
+    printf 'root_partition %s\n' "$target_root"
+    printf 'swu_next %s\n' 'reboot'
+    printf 'version %s\n' "$TARGET_VERSION"
+} > "$env_file"
+
+commit_ok=1
+if ! fw_setenv -s "$env_file"; then
+    commit_ok=0
+fi
+rm -f "$env_file"
+sync
+
+verify_ok=0
+if [ "$commit_ok" -eq 1 ]; then
+    verify_ok=1
+    [ "$(fw_printenv -n boot_partition 2>/dev/null || true)" = "$target_boot" ] || verify_ok=0
+    [ "$(fw_printenv -n root_partition 2>/dev/null || true)" = "$target_root" ] || verify_ok=0
+    [ "$(fw_printenv -n version 2>/dev/null || true)" = "$TARGET_VERSION" ] || verify_ok=0
+    [ "$(fw_printenv -n swu_next 2>/dev/null || true)" = "reboot" ] || verify_ok=0
+    [ -z "$(fw_printenv -n swu_mode 2>/dev/null || true)" ] || verify_ok=0
+fi
+
+if [ "$commit_ok" -ne 1 ] || [ "$verify_ok" -ne 1 ]; then
+    env_unchanged=1
+    [ "$(fw_printenv -n boot_partition 2>/dev/null || true)" = "$prev_boot" ] || env_unchanged=0
+    [ "$(fw_printenv -n root_partition 2>/dev/null || true)" = "$prev_root" ] || env_unchanged=0
+    [ -z "$(fw_printenv -n swu_next 2>/dev/null || true)" ] || env_unchanged=0
+    if [ -n "$prev_ver" ]; then
+        [ "$(fw_printenv -n version 2>/dev/null || true)" = "$prev_ver" ] || env_unchanged=0
+    fi
+
+    if [ "$env_unchanged" -eq 1 ]; then
+        restore_overlay_stage || printf 'CRITICAL: failed to restore staged overlay (%s) after aborted fw_setenv\n' "$stage_ov" >&2
+        fail "Failed to commit U-Boot environment via fw_setenv -s; shared overlay restored to previous state"
+    fi
+
+    rev_file=$(mktemp /tmp/k2-bootenv-rev.XXXXXX)
+    {
+        printf 'boot_partition %s\n' "$prev_boot"
+        printf 'root_partition %s\n' "$prev_root"
+        printf '%s\n' 'swu_next'
+        [ -n "$prev_ver" ] && printf 'version %s\n' "$prev_ver"
+    } > "$rev_file"
+    rev_rc=0
+    fw_setenv -s "$rev_file" || rev_rc=$?
+    rm -f "$rev_file"
+    sync
+
+    rev_ok=0
+    if [ "$rev_rc" -eq 0 ]; then
+        rev_ok=1
+        [ "$(fw_printenv -n boot_partition 2>/dev/null || true)" = "$prev_boot" ] || rev_ok=0
+        [ "$(fw_printenv -n root_partition 2>/dev/null || true)" = "$prev_root" ] || rev_ok=0
+        [ -z "$(fw_printenv -n swu_next 2>/dev/null || true)" ] || rev_ok=0
+        if [ -n "$prev_ver" ]; then
+            [ "$(fw_printenv -n version 2>/dev/null || true)" = "$prev_ver" ] || rev_ok=0
+        fi
+    fi
+
+    if [ "$rev_ok" -eq 1 ]; then
+        restore_overlay_stage || printf 'CRITICAL: reverted U-Boot env to %s/%s but failed to restore staged overlay (%s)\n' "$prev_boot" "$prev_root" "$stage_ov" >&2
+        fail "U-Boot environment commit/readback failed; reverted to $prev_boot/$prev_root and restored shared overlay"
+    fi
+
+    cur_boot_after=$(fw_printenv -n boot_partition 2>/dev/null || true)
+    cur_root_after=$(fw_printenv -n root_partition 2>/dev/null || true)
+    printf 'CRITICAL: U-Boot environment commit/readback failed AND revert to %s/%s failed (rev_rc=%s current boot=%s root=%s); staged overlay backup kept at %s\n' \
+        "$prev_boot" "$prev_root" "$rev_rc" "$cur_boot_after" "$cur_root_after" "$stage_ov" >&2
+    exit 1
+fi
+
+# Phase D: Purge staged overlay trash only after U-Boot slot commit and readback passed.
+if [ -n "$stage_ov" ] && [ -d "$stage_ov" ]; then
+    rm -rf "$stage_ov" || printf 'Warning: failed to purge overlay staging dir %s\n' "$stage_ov" >&2
+fi
+sync

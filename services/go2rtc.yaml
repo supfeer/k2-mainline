@@ -1,0 +1,22 @@
+# Creality K2 Plus go2rtc camera gateway configuration.
+# Reads cam_app hardware-encoded H.264 stream on /var/run/h264_uds via
+# SPS-aligned k2_h264_source so Creality Cloud, AI, and timelapses stay intact.
+
+api:
+  listen: ":1984"
+  origin: "*"
+
+rtsp:
+  listen: ":8554"
+
+webrtc:
+  listen: ":8555"
+  ice_servers: []
+
+log:
+  level: info
+
+streams:
+  k2:
+    - "exec:/usr/bin/k2_h264_source h264"
+    - "exec:/usr/bin/k2_h264_source mjpeg"

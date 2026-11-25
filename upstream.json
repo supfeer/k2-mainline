@@ -1,0 +1,52 @@
+{
+  "default_build_root": "/Volumes/Media4tb/k2-mainline-builds",
+  "klipper": {
+    "repo": "https://github.com/Klipper3d/klipper",
+    "tag": "v0.14.0",
+    "commit": "c9559fa04ec6b11fb1a9a1610903546319fcf310",
+    "tarball_url": "https://github.com/Klipper3d/klipper/archive/c9559fa04ec6b11fb1a9a1610903546319fcf310.tar.gz",
+    "tarball_name": "klipper-v0.14.0.tar.gz",
+    "tarball_top_dir": "klipper-c9559fa04ec6b11fb1a9a1610903546319fcf310",
+    "sha256": "295dc2f8d9cbf3b80994401173347f2c277719ebefe9c568cbd8b2427f086495",
+    "extract_dir": "klipper-v0.14.0"
+  },
+  "moonraker": {
+    "repo": "https://github.com/Arksine/moonraker",
+    "tag": "v0.10.0",
+    "commit": "16e530eb663218faa6ccd97ffb0583f1880e2983",
+    "tarball_url": "https://github.com/Arksine/moonraker/archive/16e530eb663218faa6ccd97ffb0583f1880e2983.tar.gz",
+    "tarball_name": "moonraker-v0.10.0.tar.gz",
+    "tarball_top_dir": "moonraker-16e530eb663218faa6ccd97ffb0583f1880e2983",
+    "sha256": "f223f0ccd26d6a69616bc33e95df1ee4c9dfa4fd66fbbf8d3230359bffa865a9",
+    "extract_dir": "moonraker-v0.10.0"
+  },
+  "fluidd": {
+    "tag": "v1.38.1",
+    "url": "https://github.com/fluidd-core/fluidd/releases/download/v1.38.1/fluidd.zip",
+    "filename": "fluidd-v1.38.1.zip",
+    "sha256": "eea2b7e95dbe4b1ddec4fc97547a36fd8aeac411070ad86f6cd77d67ddb57bc6"
+  },
+  "mainsail": {
+    "tag": "v2.19.0",
+    "url": "https://github.com/mainsail-crew/mainsail/releases/download/v2.19.0/mainsail.zip",
+    "filename": "mainsail-v2.19.0.zip",
+    "sha256": "c4d9d96f89851c6ae0709c2f20725447f3fe8c57cf193869b0083441bd93378a"
+  },
+  "static_curl": {
+    "tag": "8.23.0-1",
+    "url": "https://github.com/stunnel/static-curl/releases/download/8.23.0-1/curl-linux-armv7-musl-8.23.0-1.tar.xz",
+    "filename": "curl-linux-armv7-musl-8.23.0-1.tar.xz",
+    "sha256": "10245cccca6e81b654ec7454c0397ab26e4a31910440548625a3802ce0971b3b"
+  },
+  "go2rtc": {
+    "tag": "v1.9.15",
+    "url": "https://github.com/AlexxIT/go2rtc/releases/download/v1.9.15/go2rtc_linux_arm",
+    "filename": "go2rtc-v1.9.15-linux-arm",
+    "sha256": "cbffe4075a004e2015fd9d7e324800ab7968b52f49e9ce803361879d5e246028"
+  },
+  "stock_ota": {
+    "name": "CR0CN240110C10_ota_img_V1.1.4.11.img",
+    "sha256": "dc2e8b854c412533daf9ea1b6485679be3bb12a5ac36de106b0fedb448699a21",
+    "fallback_repo_rel": "../build/k2-ota-full-host-20260907-d/stock/CR0CN240110C10_ota_img_V1.1.4.11.img"
+  }
+}

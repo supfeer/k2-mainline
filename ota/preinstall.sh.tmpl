@@ -1,0 +1,250 @@
+#!/bin/sh
+set -eu
+
+KERNEL_MIN_SECTORS="@KERNEL_MIN_SECTORS@"
+ROOTFS_MIN_SECTORS="@ROOTFS_MIN_SECTORS@"
+
+fail() {
+    printf '%s\n' "K2 mainline preinstall: $*" >&2
+    exit 1
+}
+
+case "$KERNEL_MIN_SECTORS" in
+    ''|*[!0-9]*) fail "Invalid KERNEL_MIN_SECTORS: ${KERNEL_MIN_SECTORS:-unset}" ;;
+esac
+[ "$KERNEL_MIN_SECTORS" -gt 0 ] || fail "Non-positive KERNEL_MIN_SECTORS: $KERNEL_MIN_SECTORS"
+
+case "$ROOTFS_MIN_SECTORS" in
+    ''|*[!0-9]*) fail "Invalid ROOTFS_MIN_SECTORS: ${ROOTFS_MIN_SECTORS:-unset}" ;;
+esac
+[ "$ROOTFS_MIN_SECTORS" -gt 0 ] || fail "Non-positive ROOTFS_MIN_SECTORS: $ROOTFS_MIN_SECTORS"
+
+selection=${1:-}
+case "$selection" in
+    now_A_next_B)
+        expected_boot=bootA
+        expected_root=rootfsA
+        target_boot=bootB
+        target_root=rootfsB
+        ;;
+    now_B_next_A)
+        expected_boot=bootB
+        expected_root=rootfsB
+        target_boot=bootA
+        target_root=rootfsA
+        ;;
+    *)
+        fail "Missing or invalid SWUpdate slot selection: ${selection:-unset}"
+        ;;
+esac
+
+[ "$(fw_printenv -n board)" = CR0CN240110C10 ] || fail 'Wrong firmware board'
+[ "$(get_sn_mac.sh model)" = F008 ] || fail 'Wrong printer model'
+[ "$(get_sn_mac.sh board)" = CR0CN240319C13 ] || fail 'Wrong physical board'
+[ "$(get_sn_mac.sh structure_version)" = 0 ] || fail 'Wrong structure version'
+
+case "$(fw_printenv -n version)" in
+    1.1.4.11|1.1.4.9[0-9][0-9]) ;;
+    *) fail 'Unsupported installed base version' ;;
+esac
+
+boot_env=$(fw_printenv -n boot_partition)
+root_env=$(fw_printenv -n root_partition)
+[ "$boot_env" = "$expected_boot" ] || fail "boot_partition mismatch: env=$boot_env selection=$selection"
+[ "$root_env" = "$expected_root" ] || fail "root_partition mismatch: env=$root_env selection=$selection"
+
+# Verify running kernel root= matches expected active slot.
+[ -r /proc/cmdline ] || fail 'Missing /proc/cmdline'
+cmdline_root=
+for tok in $(cat /proc/cmdline); do
+    case "$tok" in
+        root=*) cmdline_root=${tok#root=} ;;
+    esac
+done
+[ -n "$cmdline_root" ] || fail 'Missing root= argument in /proc/cmdline'
+active_root_real=$(readlink -f "$cmdline_root")
+expected_root_real=$(readlink -f "/dev/by-name/$expected_root")
+[ -n "$active_root_real" ] && [ "$active_root_real" = "$expected_root_real" ] || fail "Running root ($cmdline_root -> $active_root_real) does not match $expected_root ($expected_root_real)"
+
+resolve_block_dev() {
+    link_path=$1
+    [ -e "$link_path" ] || fail "Missing device symlink: $link_path"
+    real_dev=$(readlink -f "$link_path")
+    blk_name=$(basename "$real_dev")
+    dev_file="/sys/class/block/$blk_name/dev"
+    [ -r "$dev_file" ] || fail "Missing block dev id for $link_path ($blk_name)"
+    dev_id=$(cat "$dev_file")
+    major=${dev_id%%:*}
+    minor=${dev_id#*:}
+    if [ "$major:$minor" != "$dev_id" ]; then
+        fail "Malformed block dev id for $link_path ($blk_name): $dev_id"
+    fi
+    case "$major" in
+        ''|*[!0-9]*) fail "Malformed block dev id for $link_path ($blk_name): $dev_id" ;;
+    esac
+    case "$minor" in
+        ''|*[!0-9]*) fail "Malformed block dev id for $link_path ($blk_name): $dev_id" ;;
+    esac
+    printf '%s\n' "$dev_id"
+}
+
+bootA_id=$(resolve_block_dev /dev/by-name/bootA)
+bootB_id=$(resolve_block_dev /dev/by-name/bootB)
+rootfsA_id=$(resolve_block_dev /dev/by-name/rootfsA)
+rootfsB_id=$(resolve_block_dev /dev/by-name/rootfsB)
+[ "$bootA_id" != "$bootB_id" ] || fail 'bootA and bootB alias the same block device'
+[ "$bootA_id" != "$rootfsA_id" ] || fail 'bootA and rootfsA alias the same block device'
+[ "$bootA_id" != "$rootfsB_id" ] || fail 'bootA and rootfsB alias the same block device'
+[ "$bootB_id" != "$rootfsA_id" ] || fail 'bootB and rootfsA alias the same block device'
+[ "$bootB_id" != "$rootfsB_id" ] || fail 'bootB and rootfsB alias the same block device'
+[ "$rootfsA_id" != "$rootfsB_id" ] || fail 'rootfsA and rootfsB alias the same block device'
+
+expected_root_id=$(resolve_block_dev "/dev/by-name/$expected_root")
+target_boot_id=$(resolve_block_dev "/dev/by-name/$target_boot")
+target_root_id=$(resolve_block_dev "/dev/by-name/$target_root")
+active_root_id=$(resolve_block_dev "$cmdline_root")
+[ "$expected_root_id" = "$active_root_id" ] || fail "Expected root ($expected_root=$expected_root_id) differs from active root ($active_root_id)"
+[ "$target_boot_id" != "$active_root_id" ] || fail "Target boot ($target_boot) matches currently running rootfs"
+[ "$target_root_id" != "$active_root_id" ] || fail "Target rootfs ($target_root) matches currently running rootfs"
+
+for opt_part in UDISK rootfs_data; do
+    if [ -e "/dev/by-name/$opt_part" ]; then
+        opt_id=$(resolve_block_dev "/dev/by-name/$opt_part")
+        [ "$target_boot_id" != "$opt_id" ] || fail "Target boot ($target_boot) aliases $opt_part"
+        [ "$target_root_id" != "$opt_id" ] || fail "Target rootfs ($target_root) aliases $opt_part"
+    fi
+done
+
+for slot in A B; do
+    boot_real=$(readlink -f "/dev/by-name/boot$slot")
+    boot_blk=$(basename "$boot_real")
+    boot_size_file="/sys/class/block/$boot_blk/size"
+    [ -r "$boot_size_file" ] || fail "Missing block size for boot$slot"
+    boot_sz=$(cat "$boot_size_file")
+    case "$boot_sz" in
+        ''|*[!0-9]*) fail "Malformed block size for boot$slot: $boot_sz" ;;
+    esac
+    [ "$boot_sz" -ge "$KERNEL_MIN_SECTORS" ] || fail "Insufficient block size for boot$slot: $boot_sz < $KERNEL_MIN_SECTORS sectors"
+
+    real_dev=$(readlink -f "/dev/by-name/rootfs$slot")
+    blk_name=$(basename "$real_dev")
+    size_file="/sys/class/block/$blk_name/size"
+    [ -r "$size_file" ] || fail "Missing block size for rootfs$slot"
+    root_sz=$(cat "$size_file")
+    case "$root_sz" in
+        ''|*[!0-9]*) fail "Malformed block size for rootfs$slot: $root_sz" ;;
+    esac
+    [ "$root_sz" -ge "$ROOTFS_MIN_SECTORS" ] || fail "Insufficient block size for rootfs$slot: $root_sz < $ROOTFS_MIN_SECTORS sectors"
+    [ "$root_sz" = 614400 ] || fail "Wrong root partition size for rootfs$slot"
+done
+
+# Refuse OTA while Klipper is actively printing or motion-busy.
+if [ -S /tmp/klippy_uds ] && [ -x /usr/share/klippy-env/bin/python ]; then
+    /usr/share/klippy-env/bin/python -B -c '
+import json, socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(2.0)
+try:
+    s.connect("/tmp/klippy_uds")
+except OSError:
+    sys.exit(0)
+req = json.dumps({"id": 9101, "method": "objects/query", "params": {"objects": {"print_stats": None, "idle_timeout": None}}}).encode() + b"\x03"
+s.sendall(req)
+buf = bytearray()
+while True:
+    chunk = s.recv(4096)
+    if not chunk:
+        break
+    buf.extend(chunk)
+    if 3 in chunk:
+        break
+s.close()
+if not buf:
+    sys.exit(0)
+resp = json.loads(buf.split(b"\x03", 1)[0].decode("utf-8", "replace")).get("result", {}).get("status", {})
+if resp.get("print_stats", {}).get("state") == "printing" or resp.get("idle_timeout", {}).get("state") == "Printing":
+    sys.exit(2)
+' || fail 'Printer is actively printing or moving; stop print before OTA'
+fi
+
+free_kib=$(df -Pk /mnt/UDISK | awk 'NR==2 {print $4}')
+[ -n "$free_kib" ] && [ "$free_kib" -ge 524288 ] || fail 'Insufficient persistent space on /mnt/UDISK'
+
+# Strict read-only audit of /overlay/upper before flashing; cleanup happens in postinstall.sh.
+for parent in \
+    etc \
+    etc/go2rtc \
+    etc/init.d \
+    etc/nginx \
+    etc/rc.d \
+    usr \
+    usr/bin \
+    usr/share \
+    usr/share/klipper \
+    usr/share/klipper/klippy \
+    usr/share/klipper/fw \
+    usr/share/klipper/fw/F008 \
+    usr/share/klipper/config \
+    usr/share/klipper/config/F008_CR0CN240319C13 \
+    usr/share/moonraker \
+    usr/share/moonraker-env \
+    usr/share/moonraker-env/lib \
+    usr/share/moonraker-env/lib/python3.9 \
+    usr/share/fluidd \
+    usr/share/mainsail \
+    usr/share/k2-ota
+do
+    ov_path="/overlay/upper/$parent"
+    [ ! -L "$ov_path" ] || fail "Symlink in overlay parent path: $parent"
+    if [ -e "$ov_path" ] && [ ! -d "$ov_path" ]; then
+        fail "Expected directory in overlay path: $parent"
+    fi
+    if [ -d "$ov_path" ] && [ -x /usr/share/klippy-env/bin/python ]; then
+        /usr/share/klippy-env/bin/python -B -c '
+import os, sys
+p = sys.argv[1]
+try:
+    val = os.getxattr(p, "trusted.overlay.opaque")
+except OSError:
+    sys.exit(0)
+if val == b"y":
+    sys.exit(2)
+' "$ov_path" || fail "Opaque whiteout directory in overlay path: $parent"
+    fi
+done
+
+for item in \
+    etc/go2rtc/go2rtc.yaml \
+    etc/init.d/go2rtc \
+    etc/init.d/klipper \
+    etc/init.d/klipper_mcu \
+    etc/init.d/mcu_update \
+    etc/init.d/moonraker \
+    etc/nginx/nginx.conf \
+    etc/rc.d/S98go2rtc \
+    usr/bin/klipper_mcu \
+    usr/bin/curl \
+    usr/bin/go2rtc \
+    usr/bin/k2_h264_source \
+    usr/share/klipper/config/k2_sync_config.py
+do
+    ov_item="/overlay/upper/$item"
+    [ ! -L "$ov_item" ] || {
+        # Broken or valid symlink is safe to replace if not pointing into directory,
+        # but fail closed if it resolves to an existing directory.
+        [ ! -d "$ov_item" ] || fail "Symlinked directory at file shadow: $item"
+    }
+    [ ! -d "$ov_item" ] || fail "Expected file shadow in overlay, found directory: $item"
+done
+
+umask 077
+backup=$(mktemp -d /mnt/UDISK/k2-mainline-backup.XXXXXX)
+if [ -d /mnt/UDISK/printer_data/config ]; then
+    tar -czf "$backup/config.tar.gz" -C /mnt/UDISK printer_data/config
+fi
+if [ -d /overlay/upper ]; then
+    tar -czf "$backup/overlay.tar.gz" -C /overlay upper
+fi
+printf '%s\n' "$(fw_printenv -n version)" > "$backup/version.txt"
+printf '%s\n' "$selection ($boot_env/$root_env -> $target_boot/$target_root)" > "$backup/slot.txt"
+sync

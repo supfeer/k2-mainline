@@ -1,0 +1,516 @@
+#!/bin/sh
+set -eu
+
+TARGET_VERSION="@TARGET_VERSION@"
+
+fail() {
+    printf '%s\n' "K2 mainline rollback postinstall: $*" >&2
+    exit 1
+}
+
+[ -n "$TARGET_VERSION" ] || fail 'Missing TARGET_VERSION'
+case "$TARGET_VERSION" in
+    *@*) fail "Unrendered TARGET_VERSION placeholder: $TARGET_VERSION" ;;
+esac
+
+selection=${1:-}
+case "$selection" in
+    now_A_next_B)
+        prev_boot=bootA
+        prev_root=rootfsA
+        target_boot=bootB
+        target_root=rootfsB
+        ;;
+    now_B_next_A)
+        prev_boot=bootB
+        prev_root=rootfsB
+        target_boot=bootA
+        target_root=rootfsA
+        ;;
+    *) fail "Invalid slot selection in rollback postinstall: ${selection:-unset}" ;;
+esac
+
+# Phase A: Validate slot state, /overlay/upper safety, and complete 1.1.4.11 backup BEFORE writes.
+prev_ver=$(fw_printenv -n version 2>/dev/null || true)
+cur_boot=$(fw_printenv -n boot_partition 2>/dev/null || true)
+cur_root=$(fw_printenv -n root_partition 2>/dev/null || true)
+[ "$cur_boot" = "$prev_boot" ] || fail "Unexpected active boot_partition: $cur_boot != $prev_boot"
+[ "$cur_root" = "$prev_root" ] || fail "Unexpected active root_partition: $cur_root != $prev_root"
+
+cfg_dir="/mnt/UDISK/printer_data/config"
+[ -d /mnt/UDISK ] || fail "Missing persistent storage /mnt/UDISK"
+[ ! -L "$cfg_dir" ] || fail "Refusing symlinked config directory: $cfg_dir"
+
+for parent in \
+    etc \
+    etc/go2rtc \
+    etc/init.d \
+    etc/nginx \
+    etc/rc.d \
+    usr \
+    usr/bin \
+    usr/share \
+    usr/share/klipper \
+    usr/share/klipper/klippy \
+    usr/share/klipper/fw \
+    usr/share/klipper/fw/F008 \
+    usr/share/klipper/config \
+    usr/share/klipper/config/F008_CR0CN240319C13 \
+    usr/share/moonraker \
+    usr/share/moonraker-env \
+    usr/share/moonraker-env/lib \
+    usr/share/moonraker-env/lib/python3.9 \
+    usr/share/fluidd \
+    usr/share/mainsail \
+    usr/share/k2-ota
+do
+    ov_path="/overlay/upper/$parent"
+    [ ! -L "$ov_path" ] || fail "Symlink in overlay parent path: $parent"
+    if [ -e "$ov_path" ] && [ ! -d "$ov_path" ]; then
+        fail "Expected directory in overlay path: $parent"
+    fi
+done
+
+for item in \
+    etc/go2rtc/go2rtc.yaml \
+    etc/init.d/go2rtc \
+    etc/init.d/klipper \
+    etc/init.d/klipper_mcu \
+    etc/init.d/mcu_update \
+    etc/init.d/moonraker \
+    etc/nginx/nginx.conf \
+    etc/rc.d/S98go2rtc \
+    usr/bin/klipper_mcu \
+    usr/bin/curl \
+    usr/bin/go2rtc \
+    usr/bin/k2_h264_source \
+    usr/share/klipper/config/k2_sync_config.py
+do
+    shadow="/overlay/upper/$item"
+    [ ! -d "$shadow" ] || fail "Refusing to unlink directory at file shadow: $item"
+done
+
+for tree in \
+    etc/go2rtc \
+    usr/share/klipper/klippy \
+    usr/share/klipper/fw/F008 \
+    usr/share/klipper/config/F008_CR0CN240319C13 \
+    usr/share/moonraker \
+    usr/share/moonraker-env/lib/python3.9/site-packages \
+    usr/share/fluidd \
+    usr/share/mainsail \
+    usr/share/k2-ota
+do
+    shadow_dir="/overlay/upper/$tree"
+    [ ! -L "$shadow_dir" ] || fail "Refusing to remove symlinked overlay tree: $tree"
+done
+
+py_bin=""
+if [ -x /usr/share/klippy-env/bin/python ]; then
+    py_bin=/usr/share/klippy-env/bin/python
+elif command -v python3 >/dev/null 2>&1; then
+    py_bin=$(command -v python3)
+fi
+
+valid_restore_dir=""
+for bdir in $(ls -1dt /mnt/UDISK/k2-mainline-backup.* 2>/dev/null || true); do
+    [ -d "$bdir" ] || continue
+    [ -f "$bdir/version.txt" ] || continue
+    [ -f "$bdir/config.tar.gz" ] || continue
+    ver=$(head -n 1 "$bdir/version.txt" 2>/dev/null || true)
+    [ "$ver" = "1.1.4.11" ] || continue
+    [ -n "$py_bin" ] || continue
+
+    cand_dir=$(mktemp -d /mnt/UDISK/.rollback-cfg.XXXXXX)
+    if ! tar -xzf "$bdir/config.tar.gz" -C "$cand_dir" >/dev/null 2>&1; then
+        rm -rf "$cand_dir"
+        continue
+    fi
+
+    cand_cfg="$cand_dir/printer_data/config"
+    if "$py_bin" -B -c '
+import configparser, glob, os, re, sys
+from pathlib import Path
+
+cfg_root = Path(sys.argv[1])
+if not cfg_root.is_dir() or cfg_root.is_symlink():
+    sys.exit(2)
+cfg_real = cfg_root.resolve()
+
+required = (
+    "printer.cfg",
+    "gcode_macro.cfg",
+    "printer_params.cfg",
+    "sensorless.cfg",
+    "motor_control.cfg",
+    "box.cfg",
+)
+forbidden_re = re.compile(
+    r"#\s*Version:\s*v?9\.5\.0|k2_print\.cfg|k2_load_cell\.cfg|k2_print|chamber_fan_target"
+)
+
+for name in required:
+    p = cfg_root / name
+    if not p.is_file() or p.is_symlink() or p.stat().st_size == 0:
+        sys.exit(3)
+
+def ensure_inside(path_obj):
+    norm_path = Path(os.path.normpath(str(path_obj)))
+    rel = norm_path.relative_to(cfg_root)
+    cur = cfg_root
+    for part in rel.parts:
+        cur = cur / part
+        if cur.is_symlink():
+            raise ValueError("symlink in config path")
+    resolved = norm_path.resolve()
+    resolved.relative_to(cfg_real)
+    return resolved
+
+def strip_comment(line):
+    cuts = [i for i in (line.find("#"), line.find(";")) if i >= 0]
+    return line[:min(cuts)] if cuts else line
+
+visited = set()
+visiting = set()
+
+def parse_file(fpath):
+    fpath_real = ensure_inside(fpath)
+    if fpath_real in visiting:
+        raise ValueError("cyclic include")
+    if fpath_real in visited:
+        return
+    if not fpath.is_file() or fpath.is_symlink() or fpath.stat().st_size == 0:
+        raise ValueError("missing or empty config")
+    if fpath.name.startswith("k2_"):
+        raise ValueError("forbidden k2_ config")
+    text = fpath.read_text(encoding="utf-8")
+    if forbidden_re.search(text):
+        raise ValueError("forbidden .950 marker")
+    parser = configparser.RawConfigParser(strict=False, inline_comment_prefixes=("#", ";"))
+    parser.read_string(text, source=str(fpath))
+
+    visiting.add(fpath_real)
+    seen_section = False
+    try:
+        for raw_line in text.splitlines():
+            if not raw_line.strip():
+                continue
+            if raw_line.lstrip().startswith(("#", ";")):
+                continue
+            if raw_line[0].isspace():
+                if not seen_section:
+                    raise ValueError("indented line before section")
+                continue
+            clean = strip_comment(raw_line).strip()
+            if not clean:
+                continue
+            if clean.startswith("["):
+                if not clean.endswith("]") or "[" in clean[1:-1]:
+                    raise ValueError("malformed section header")
+                seen_section = True
+                section = clean[1:-1].strip()
+                if section == "include" or section.startswith("include "):
+                    spec = section[7:].strip()
+                    if not spec or os.path.isabs(spec):
+                        raise ValueError("invalid include spec")
+                    base_rel = str(fpath.parent.relative_to(cfg_root))
+                    joined_rel = spec if base_rel == "." else os.path.join(base_rel, spec)
+                    norm_rel = os.path.normpath(joined_rel)
+                    if norm_rel == ".." or norm_rel.startswith(".." + os.sep) or os.path.isabs(norm_rel):
+                        raise ValueError("include escapes config root")
+                    cand = cfg_root / norm_rel
+                    if any(ch in spec for ch in ("*", "?", "[")):
+                        for match_str in sorted(glob.glob(str(cand))):
+                            parse_file(Path(match_str))
+                    else:
+                        parse_file(cand)
+            else:
+                if not seen_section:
+                    raise ValueError("option outside section")
+    finally:
+        visiting.remove(fpath_real)
+    visited.add(fpath_real)
+
+try:
+    parse_file(cfg_root / "printer.cfg")
+    for name in required:
+        if (cfg_root / name).resolve() not in visited:
+            parse_file(cfg_root / name)
+except Exception:
+    sys.exit(4)
+' "$cand_cfg"; then
+        valid_restore_dir="$cand_dir"
+        break
+    fi
+    rm -rf "$cand_dir"
+done
+
+# Phase B: Reversibly stage config swap and /overlay/upper shadows BEFORE modifying U-Boot env.
+stamp=$(date +%Y%m%d-%H%M%S)
+archive_dir="$cfg_dir/backups/pre-rollback-$stamp"
+mkdir -p "$archive_dir"
+for f in "$cfg_dir"/*.cfg; do
+    [ -f "$f" ] || continue
+    if ! cp -af "$f" "$archive_dir/"; then
+        rm -rf "$archive_dir" || true
+        [ -z "$valid_restore_dir" ] || rm -rf "$valid_restore_dir"
+        fail "Failed to archive $f before rollback; configs, overlay, and U-Boot env left untouched"
+    fi
+done
+
+prev_cfg_stage=$(mktemp -d /mnt/UDISK/.rollback-prev-cfg.XXXXXX)
+: > "$prev_cfg_stage/.installed"
+
+stage_ov=""
+if [ -d /overlay/upper ]; then
+    stage_ov=$(mktemp -d /overlay/.k2-ota-stage.XXXXXX)
+    : > "$stage_ov/.manifest"
+fi
+
+restore_cfg_stage() {
+    [ -n "${prev_cfg_stage:-}" ] || return 0
+    [ -d "$prev_cfg_stage" ] || return 0
+    if [ -s "$prev_cfg_stage/.installed" ]; then
+        while IFS= read -r inst_name; do
+            [ -n "$inst_name" ] || continue
+            rm -rf "$cfg_dir/$inst_name" || return 1
+        done < "$prev_cfg_stage/.installed"
+    fi
+    for saved in "$prev_cfg_stage"/*; do
+        [ -e "$saved" ] || [ -L "$saved" ] || continue
+        mv "$saved" "$cfg_dir/" || return 1
+    done
+    rm -rf "$prev_cfg_stage" || return 1
+    rm -rf "$archive_dir" || true
+    return 0
+}
+
+restore_overlay_stage() {
+    [ -n "${stage_ov:-}" ] || return 0
+    [ -d "$stage_ov" ] || return 0
+    if [ -s "$stage_ov/.manifest" ]; then
+        awk '{lines[NR]=$0} END {for (i=NR; i>=1; i--) if (length(lines[i])>0) print lines[i]}' "$stage_ov/.manifest" > "$stage_ov/.rev" || return 1
+        while IFS='|' read -r orig_rel stage_sub; do
+            [ -n "$orig_rel" ] || continue
+            src="$stage_ov/$stage_sub"
+            dst="/overlay/upper/$orig_rel"
+            mkdir -p "$(dirname "$dst")" || return 1
+            mv "$src" "$dst" || return 1
+        done < "$stage_ov/.rev"
+    fi
+    rm -rf "$stage_ov" || return 1
+    return 0
+}
+
+restore_all_stage() {
+    rc=0
+    restore_overlay_stage || rc=1
+    restore_cfg_stage || rc=1
+    sync
+    return "$rc"
+}
+
+stage_cfg_item() {
+    p=$1
+    if [ -e "$p" ] || [ -L "$p" ]; then
+        mv "$p" "$prev_cfg_stage/" || return 1
+    fi
+    return 0
+}
+
+mkdir -p "$cfg_dir"
+for k2_f in "$cfg_dir"/k2_*.cfg; do
+    if ! stage_cfg_item "$k2_f"; then
+        restore_all_stage || printf 'CRITICAL: failed to restore configs after staging %s\n' "$k2_f" >&2
+        [ -z "$valid_restore_dir" ] || rm -rf "$valid_restore_dir"
+        fail "Failed to stage $k2_f before rollback; state restored and U-Boot env left untouched"
+    fi
+done
+
+for ov_f in \
+    printer.cfg \
+    gcode_macro.cfg \
+    printer_params.cfg \
+    sensorless.cfg \
+    motor_control.cfg \
+    factory_printer.cfg
+do
+    if ! stage_cfg_item "$cfg_dir/$ov_f"; then
+        restore_all_stage || printf 'CRITICAL: failed to restore configs after staging %s\n' "$ov_f" >&2
+        [ -z "$valid_restore_dir" ] || rm -rf "$valid_restore_dir"
+        fail "Failed to stage $ov_f before rollback; state restored and U-Boot env left untouched"
+    fi
+done
+
+if [ -n "$valid_restore_dir" ]; then
+    if ! stage_cfg_item "$cfg_dir/box.cfg"; then
+        restore_all_stage || printf 'CRITICAL: failed to restore configs after staging box.cfg\n' >&2
+        rm -rf "$valid_restore_dir"
+        fail "Failed to stage box.cfg before rollback; state restored and U-Boot env left untouched"
+    fi
+    for rf in "$valid_restore_dir"/printer_data/config/*; do
+        [ -e "$rf" ] || continue
+        base=$(basename "$rf")
+        [ "$base" != "backups" ] || continue
+        if ! stage_cfg_item "$cfg_dir/$base"; then
+            restore_all_stage || printf 'CRITICAL: failed to restore configs after staging %s\n' "$base" >&2
+            rm -rf "$valid_restore_dir"
+            fail "Failed to stage existing $base before rollback; state restored and U-Boot env left untouched"
+        fi
+        printf '%s\n' "$base" >> "$prev_cfg_stage/.installed"
+        if ! cp -af "$rf" "$cfg_dir/"; then
+            restore_all_stage || printf 'CRITICAL: failed to restore configs after copy error\n' >&2
+            rm -rf "$valid_restore_dir"
+            fail "Failed to stage restored config $base; state restored and U-Boot env left untouched"
+        fi
+    done
+fi
+
+stage_idx=0
+for item in \
+    etc/go2rtc/go2rtc.yaml \
+    etc/init.d/go2rtc \
+    etc/init.d/klipper \
+    etc/init.d/klipper_mcu \
+    etc/init.d/mcu_update \
+    etc/init.d/moonraker \
+    etc/nginx/nginx.conf \
+    etc/rc.d/S98go2rtc \
+    usr/bin/klipper_mcu \
+    usr/bin/curl \
+    usr/bin/go2rtc \
+    usr/bin/k2_h264_source \
+    usr/share/klipper/config/k2_sync_config.py
+do
+    shadow="/overlay/upper/$item"
+    if [ -e "$shadow" ] || [ -L "$shadow" ] || [ -c "$shadow" ]; then
+        stage_idx=$((stage_idx + 1))
+        mkdir -p "$stage_ov/items" || {
+            restore_all_stage || printf 'CRITICAL: failed to restore staged state (%s)\n' "$stage_ov" >&2
+            [ -z "$valid_restore_dir" ] || rm -rf "$valid_restore_dir"
+            fail "Failed to prepare overlay stage for $item; U-Boot env left untouched"
+        }
+        if ! mv "$shadow" "$stage_ov/items/$stage_idx"; then
+            restore_all_stage || printf 'CRITICAL: failed to restore staged state after mv error (%s)\n' "$stage_ov" >&2
+            [ -z "$valid_restore_dir" ] || rm -rf "$valid_restore_dir"
+            fail "Failed to stage overlay shadow $item; U-Boot env left untouched"
+        fi
+        printf '%s|%s\n' "$item" "items/$stage_idx" >> "$stage_ov/.manifest"
+    fi
+done
+
+for tree in \
+    etc/go2rtc \
+    usr/share/klipper/klippy \
+    usr/share/klipper/fw/F008 \
+    usr/share/klipper/config/F008_CR0CN240319C13 \
+    usr/share/moonraker \
+    usr/share/moonraker-env/lib/python3.9/site-packages \
+    usr/share/fluidd \
+    usr/share/mainsail \
+    usr/share/k2-ota
+do
+    shadow_dir="/overlay/upper/$tree"
+    if [ -d "$shadow_dir" ] || [ -e "$shadow_dir" ] || [ -L "$shadow_dir" ] || [ -c "$shadow_dir" ]; then
+        stage_idx=$((stage_idx + 1))
+        mkdir -p "$stage_ov/items" || {
+            restore_all_stage || printf 'CRITICAL: failed to restore staged state (%s)\n' "$stage_ov" >&2
+            [ -z "$valid_restore_dir" ] || rm -rf "$valid_restore_dir"
+            fail "Failed to prepare overlay stage for $tree; U-Boot env left untouched"
+        }
+        if ! mv "$shadow_dir" "$stage_ov/items/$stage_idx"; then
+            restore_all_stage || printf 'CRITICAL: failed to restore staged state after mv error (%s)\n' "$stage_ov" >&2
+            [ -z "$valid_restore_dir" ] || rm -rf "$valid_restore_dir"
+            fail "Failed to stage overlay tree $tree; U-Boot env left untouched"
+        fi
+        printf '%s|%s\n' "$tree" "items/$stage_idx" >> "$stage_ov/.manifest"
+    fi
+done
+sync
+
+# Phase C: Atomically commit and verify U-Boot slot env; revert and restore staged state on failure.
+mkdir -p /var/lock
+env_file=$(mktemp /tmp/k2-bootenv.XXXXXX)
+{
+    printf '%s\n' 'swu_mode'
+    printf 'boot_partition %s\n' "$target_boot"
+    printf 'root_partition %s\n' "$target_root"
+    printf 'swu_next %s\n' 'reboot'
+    printf 'version %s\n' "$TARGET_VERSION"
+} > "$env_file"
+
+commit_ok=1
+if ! fw_setenv -s "$env_file"; then
+    commit_ok=0
+fi
+rm -f "$env_file"
+sync
+
+verify_ok=0
+if [ "$commit_ok" -eq 1 ]; then
+    verify_ok=1
+    [ "$(fw_printenv -n boot_partition 2>/dev/null || true)" = "$target_boot" ] || verify_ok=0
+    [ "$(fw_printenv -n root_partition 2>/dev/null || true)" = "$target_root" ] || verify_ok=0
+    [ "$(fw_printenv -n version 2>/dev/null || true)" = "$TARGET_VERSION" ] || verify_ok=0
+    [ "$(fw_printenv -n swu_next 2>/dev/null || true)" = "reboot" ] || verify_ok=0
+    [ -z "$(fw_printenv -n swu_mode 2>/dev/null || true)" ] || verify_ok=0
+fi
+
+if [ "$commit_ok" -ne 1 ] || [ "$verify_ok" -ne 1 ]; then
+    env_unchanged=1
+    [ "$(fw_printenv -n boot_partition 2>/dev/null || true)" = "$prev_boot" ] || env_unchanged=0
+    [ "$(fw_printenv -n root_partition 2>/dev/null || true)" = "$prev_root" ] || env_unchanged=0
+    [ -z "$(fw_printenv -n swu_next 2>/dev/null || true)" ] || env_unchanged=0
+    if [ -n "$prev_ver" ]; then
+        [ "$(fw_printenv -n version 2>/dev/null || true)" = "$prev_ver" ] || env_unchanged=0
+    fi
+
+    if [ "$env_unchanged" -eq 1 ]; then
+        restore_all_stage || printf 'CRITICAL: failed to restore configs/overlay (%s, %s) after aborted fw_setenv\n' "$prev_cfg_stage" "$stage_ov" >&2
+        [ -z "$valid_restore_dir" ] || rm -rf "$valid_restore_dir"
+        fail "Failed to commit U-Boot environment via fw_setenv -s; configs and overlay restored"
+    fi
+
+    rev_file=$(mktemp /tmp/k2-bootenv-rev.XXXXXX)
+    {
+        printf 'boot_partition %s\n' "$prev_boot"
+        printf 'root_partition %s\n' "$prev_root"
+        printf '%s\n' 'swu_next'
+        [ -n "$prev_ver" ] && printf 'version %s\n' "$prev_ver"
+    } > "$rev_file"
+    rev_rc=0
+    fw_setenv -s "$rev_file" || rev_rc=$?
+    rm -f "$rev_file"
+    sync
+
+    rev_ok=0
+    if [ "$rev_rc" -eq 0 ]; then
+        rev_ok=1
+        [ "$(fw_printenv -n boot_partition 2>/dev/null || true)" = "$prev_boot" ] || rev_ok=0
+        [ "$(fw_printenv -n root_partition 2>/dev/null || true)" = "$prev_root" ] || rev_ok=0
+        [ -z "$(fw_printenv -n swu_next 2>/dev/null || true)" ] || rev_ok=0
+        if [ -n "$prev_ver" ]; then
+            [ "$(fw_printenv -n version 2>/dev/null || true)" = "$prev_ver" ] || rev_ok=0
+        fi
+    fi
+
+    [ -z "$valid_restore_dir" ] || rm -rf "$valid_restore_dir"
+    if [ "$rev_ok" -eq 1 ]; then
+        restore_all_stage || printf 'CRITICAL: reverted U-Boot env to %s/%s but failed to restore configs/overlay (%s, %s)\n' "$prev_boot" "$prev_root" "$prev_cfg_stage" "$stage_ov" >&2
+        fail "U-Boot environment commit/readback failed; reverted to $prev_boot/$prev_root and restored configs and overlay"
+    fi
+
+    cur_boot_after=$(fw_printenv -n boot_partition 2>/dev/null || true)
+    cur_root_after=$(fw_printenv -n root_partition 2>/dev/null || true)
+    printf 'CRITICAL: rollback U-Boot commit/readback failed AND revert to %s/%s failed (rev_rc=%s current boot=%s root=%s); backups kept at %s and %s\n' \
+        "$prev_boot" "$prev_root" "$rev_rc" "$cur_boot_after" "$cur_root_after" "$prev_cfg_stage" "$stage_ov" >&2
+    exit 1
+fi
+
+# Phase D: Purge temporary staging directories after rollback U-Boot commit succeeded.
+rm -rf "$prev_cfg_stage" || printf 'Warning: failed to purge config stage %s\n' "$prev_cfg_stage" >&2
+if [ -n "$stage_ov" ] && [ -d "$stage_ov" ]; then
+    rm -rf "$stage_ov" || printf 'Warning: failed to purge overlay stage %s\n' "$stage_ov" >&2
+fi
+[ -z "$valid_restore_dir" ] || rm -rf "$valid_restore_dir" || true
+sync
