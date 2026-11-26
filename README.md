@@ -21,6 +21,10 @@
   - при старте системы исключён общий обновлятор `mcu_util_485`: двухфазный `/etc/init.d/mcu_update` проверяет аппаратные префиксы и загрузочные версии обеих плат до записи и прошивает только `MAIN` и `NOZZLE` (учитывая автозапуск приложения командой `mcu_util -u`), а эталонный стоковый скрипт сохранён без изменений в `/usr/share/k2-ota/mcu_update.stock` вместе со стоковыми прошивками CFS `1.1.3`;
   - неидемпотентные команды подачи/отвода CFS (`EXTRUDE_PROCESS` / `RETRUDE_PROCESS` / `EXTRUDE_PROCESS_MODEL2`) выполняются с `retries_en=False`, а верхний уровень блокирует повторную подачу/отвод при неопределённом исходе транспорта (`TIMEOUT` / `CRC_ERR` / `LENGTH_ERR`).
 - **Один OTA-файл `.img`**: двустадийный `sw-description` (`preinstall.sh` + `postinstall.sh`) с жёсткой проверкой активного A/B-слота, перекрёстных блочных алиасов, отсутствия активной печати и атомарной фиксацией переменных U-Boot до очистки общих теней overlay.
+- **OTA-обновления через GitHub Releases (`supfeer/k2-mainline`)**:
+  - **Штатный экран K2 Plus**: лёгкий loopback-прокси `k2_ota_proxy` (`127.0.0.1:7129`) и точечный `LD_PRELOAD`-шим `/usr/lib/libk2_ota_shim.so` (подключаемый только к `app-server`, при этом бинарник `usr/bin/app-server` остаётся нетронутым) перенаправляют запросы проверки прошивки `/api/cxy/v2/firmware/list` на `manifest.json` из GitHub Releases. Для прошивки Linux (`type=2`, `F008`) экран видит свежий релиз `k2_mainline`, а запросы CFS (`type=27`) всегда получают пустой ответ для защиты CFS `1.1.3`. При скачивании прокси проверяет SHA-256 и отдаёт заголовок `x-oss-hash-crc64ecma`, прерывая передачу при любом повреждении.
+  - **CLI на принтере**: встроенная утилита `/usr/bin/k2-ota-update --check` и `k2-ota-update --apply` (поддерживает переопределение репозитория в `/mnt/UDISK/printer_data/config/k2_ota.conf`).
+  - **Публикация релизов с Mac**: `make -C k2_mainline publish-release` проверяет `ota_verification_report.json`, генерирует `manifest.json` (с `sha256`, `md5`, `crc64ecma`) + `SHA256SUMS` и загружает релиз на GitHub Releases.
 - **Чистый репозиторий**: все исходники, кеши и артефакты сборки хранятся в `$K2_BUILD_ROOT` (`/Volumes/Media4tb/k2-mainline-builds`).
 
 ---
@@ -52,6 +56,8 @@ make -C k2_mainline -j4 all
 | `ota` | Проверка соответствия хэшей входов, перепаковка SquashFS, проверка `swupdate` / `preinstall` / `postinstall` / `mcu_update` в `work/ota-stage` и публикация в `out/ota/` |
 | `test` | Полная сборка зависимостей + запуск `unittest` (`test_milestone1.py`, `test_host_and_ota.py`) |
 | `test-only` | Запуск автотестов без пересборки |
+| `publish-release-dry` | Генерация и валидация `manifest.json` и `SHA256SUMS` для проверенного `.img` без загрузки на GitHub |
+| `publish-release` | Публикация проверенного `.img`, `manifest.json` и `SHA256SUMS` в GitHub Releases (`supfeer/k2-mainline`) |
 | `clean-work` | Очистка staging-каталогов в `$K2_BUILD_ROOT/work/*-stage` |
 
 Для генерации дополнительного отладочного образа отката на сток `1.1.4.11` (`V1.1.4.951` с `rollback_postinstall.sh`):

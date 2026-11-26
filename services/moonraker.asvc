@@ -3,3 +3,4 @@ klipper_mcu
 moonraker
 nginx
 go2rtc
+k2_ota_proxy

@@ -1,0 +1,25 @@
+#!/bin/sh /etc/rc.common
+
+START=97
+STOP=02
+USE_PROCD=1
+DEPEND=fstab
+
+PROG=/usr/share/klippy-env/bin/python
+SCRIPT=/usr/bin/k2-ota-update
+USER_DATA=/mnt/UDISK/printer_data
+CONF=${USER_DATA}/config/k2_ota.conf
+
+start_service() {
+    [ "x$(get_sn_mac.sh pcba_test)" = "x1" ] && exit 0
+    [ -x "$PROG" ] || exit 1
+    [ -r "$SCRIPT" ] || exit 1
+
+    mkdir -p "${USER_DATA}/config"
+
+    procd_open_instance
+    procd_set_param env HOME=/mnt/UDISK
+    procd_set_param command ${PROG} -B ${SCRIPT} --serve --config ${CONF}
+    procd_set_param respawn 3600 5 5
+    procd_close_instance
+}

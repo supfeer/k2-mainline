@@ -5,7 +5,7 @@ export K2_BUILD_ROOT
 
 PYTHON ?= python3 -B
 
-.PHONY: all fetch mcu native services host ota test test-only clean-work
+.PHONY: all fetch mcu native services host ota test test-only publish-release publish-release-dry clean-work
 
 all: test
 
@@ -33,6 +33,12 @@ test: ota
 
 test-only:
 	$(PYTHON) -m unittest discover -s tests -p 'test_*.py'
+
+publish-release-dry:
+	$(PYTHON) scripts/publish_github_release.py --dry-run
+
+publish-release:
+	$(PYTHON) scripts/publish_github_release.py
 
 clean-work:
 	rm -rf "$(K2_BUILD_ROOT)/work/mcu-stage" "$(K2_BUILD_ROOT)/work/native-stage" "$(K2_BUILD_ROOT)/work/ota-stage"

@@ -16,6 +16,7 @@ from pathlib import Path
 sys.path.insert(0, "/src/k2_mainline/ota")
 from cpio_crc import crc32_bytesum, mapped_cpio_crc, write_cpio_crc  # noqa: E402
 from init_patches import (  # noqa: E402
+    patch_app_init,
     patch_klipper_init,
     patch_klipper_mcu_init,
     patch_mcu_update_init,
@@ -240,7 +241,6 @@ def main(argv: list[str] | None = None) -> int:
         "usr/bin/webrtc_local",
         "usr/bin/cam_app",
         "usr/bin/mdns",
-        "etc/init.d/app",
         "etc/init.d/webrtc",
         "etc/init.d/mdns",
         "etc/init.d/device_manager",
@@ -510,6 +510,46 @@ def main(argv: list[str] | None = None) -> int:
     go2rtc_rc_dst.symlink_to("../init.d/go2rtc")
     os.lchown(go2rtc_rc_dst, 0, 0)
     allowed_changes.add("etc/rc.d/S98go2rtc")
+
+    # Install GitHub Releases OTA updater, loopback screen proxy, and app-server LD_PRELOAD shim.
+    ota_shim_dst = root / "usr/lib/libk2_ota_shim.so"
+    if ota_shim_dst.exists() or ota_shim_dst.is_symlink():
+        raise RuntimeError("Unexpected existing usr/lib/libk2_ota_shim.so in stock rootfs")
+    _install_file(Path("/inputs/native/libk2_ota_shim.so"), ota_shim_dst, 0o755)
+    allowed_changes.add("usr/lib/libk2_ota_shim.so")
+
+    ota_cli_dst = root / "usr/bin/k2-ota-update"
+    if ota_cli_dst.exists() or ota_cli_dst.is_symlink():
+        raise RuntimeError("Unexpected existing usr/bin/k2-ota-update in stock rootfs")
+    _install_file(Path("/src/k2_mainline/services/k2_ota_update.py"), ota_cli_dst, 0o755)
+    allowed_changes.add("usr/bin/k2-ota-update")
+
+    ota_init_dst = root / "etc/init.d/k2_ota_proxy"
+    if ota_init_dst.exists() or ota_init_dst.is_symlink():
+        raise RuntimeError("Unexpected existing etc/init.d/k2_ota_proxy in stock rootfs")
+    _install_file(Path("/src/k2_mainline/services/init_k2_ota_proxy"), ota_init_dst, 0o755)
+    allowed_changes.add("etc/init.d/k2_ota_proxy")
+
+    ota_rc_dst = root / "etc/rc.d/S97k2_ota_proxy"
+    if ota_rc_dst.exists() or ota_rc_dst.is_symlink():
+        raise RuntimeError("Unexpected existing etc/rc.d/S97k2_ota_proxy in stock rootfs")
+    ota_rc_dst.symlink_to("../init.d/k2_ota_proxy")
+    os.lchown(ota_rc_dst, 0, 0)
+    allowed_changes.add("etc/rc.d/S97k2_ota_proxy")
+
+    app_init = root / "etc/init.d/app"
+    if not app_init.is_file():
+        raise RuntimeError("Missing stock etc/init.d/app")
+    app_init_stock_sha = before["etc/init.d/app"][3]
+    app_init_ref = ref_dir / "app.init.stock"
+    _install_file(app_init, app_init_ref, 0o644)
+    allowed_changes.add("usr/share/k2-ota/app.init.stock")
+    preserved_pins["usr/share/k2-ota/app.init.stock"] = app_init_stock_sha
+
+    app_init.write_text(patch_app_init(app_init.read_text(encoding="utf-8")), encoding="utf-8")
+    app_init.chmod(0o755)
+    os.chown(app_init, 0, 0)
+    allowed_changes.add("etc/init.d/app")
 
     # 6. Verify strict rootfs change set & preserved components.
     after = tree_state(root)

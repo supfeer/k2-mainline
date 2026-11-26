@@ -143,7 +143,7 @@ def main(argv: list[str] | None = None) -> int:
     if not report_path.is_file():
         raise FileNotFoundError(f"Expected container report missing: {report_path}")
     report = json.loads(report_path.read_text(encoding="utf-8"))
-    for name in ("c_helper.so", "k2_hardware.so", "klipper_mcu"):
+    for name in ("c_helper.so", "k2_hardware.so", "libk2_ota_shim.so", "klipper_mcu"):
         artifact = out_native / name
         if not artifact.is_file():
             raise FileNotFoundError(f"Missing expected output artifact: {artifact}")

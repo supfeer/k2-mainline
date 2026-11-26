@@ -25,6 +25,7 @@ KLIPPY_DIR = Path("/src/klippy")
 K2_CONFIG_DIR = Path("/src/k2_mainline/config")
 K2_SERVICES_SRC = Path("/src/k2_mainline/services")
 MCU_DIR = Path("/src/mcu")
+NATIVE_DIR = Path("/src/native")
 SERVICES_DIR = Path("/src/services")
 STOCK_ROOTFS_TAR = Path("/src/stock-chroot.tar")
 OUT_DIR = Path("/out")
@@ -1804,6 +1805,195 @@ fluidd_rel = json.loads(Path("/usr/share/fluidd/release_info.json").read_text(en
 mainsail_rel = json.loads(Path("/usr/share/mainsail/release_info.json").read_text(encoding="utf-8"))
 subprocess.run(["/usr/sbin/nginx", "-t", "-c", "/etc/nginx/nginx.conf", "-g", "daemon off;"], check=True)
 
+# Verify K2 GitHub Releases OTA updater, loopback screen proxy, CRC64/version parity with stock
+# libcrealitycloud.so, and live LD_PRELOAD=libk2_ota_shim.so interception with stock libcurl.so.4.
+subprocess.run(["/bin/sh", "-n", "/etc/init.d/k2_ota_proxy"], check=True)
+subprocess.run(["/bin/sh", "-n", "/etc/init.d/app"], check=True)
+import ctypes as _ct
+import hashlib as _hl
+import http.server as _hs
+import importlib.machinery as _imach
+import importlib.util as _iutil
+import urllib.request as _ureq
+
+_ota_loader = _imach.SourceFileLoader("k2_ota_update_mod", "/usr/bin/k2-ota-update")
+_ota_spec = _iutil.spec_from_loader("k2_ota_update_mod", _ota_loader)
+_ota_mod = _iutil.module_from_spec(_ota_spec)
+_ota_loader.exec_module(_ota_mod)
+
+# 1. Bit-exact parity of CRC64-ECMA and VersionStringToInt64 against stock libcrealitycloud.so.
+_cloud_lib = _ct.CDLL("/usr/lib/libcrealitycloud.so")
+_calc_crc = _cloud_lib._ZN12AlibabaCloud3OSS5CRC647CalcCRCEyPvj
+_calc_crc.argtypes = [_ct.c_uint64, _ct.c_void_p, _ct.c_uint32]
+_calc_crc.restype = _ct.c_uint64
+_sample_buf = b"123456789" + bytes(range(256))
+_native_crc = _calc_crc(0, _ct.c_char_p(_sample_buf), len(_sample_buf))
+_py_crc = _ota_mod.crc64_ecma_bytes(_sample_buf)
+if _native_crc != _py_crc:
+    raise AssertionError(f"CRC64 mismatch vs libcrealitycloud.so: native={_native_crc} py={_py_crc}")
+
+_ver_to_i64 = _cloud_lib._ZN4util20VersionStringToInt64EPc
+_ver_to_i64.argtypes = [_ct.c_char_p]
+_ver_to_i64.restype = _ct.c_uint64
+for _ver_s in ("1.1.4.11", "1.1.4.950", "1.1.4.952", "1.1.4.999"):
+    _nv = _ver_to_i64(_ver_s.encode("ascii"))
+    _pv = _ota_mod.version_to_int64(_ver_s)
+    if _nv != _pv:
+        raise AssertionError(f"VersionStringToInt64 mismatch for {_ver_s}: native={_nv:#x} py={_pv:#x}")
+if not (_ver_to_i64(b"1.1.4.952") > _ver_to_i64(b"1.1.4.950") > _ver_to_i64(b"1.1.4.11")):
+    raise AssertionError("Non-monotonic native VersionStringToInt64 ordering")
+
+# 2. End-to-end loopback screen OTA proxy + LD_PRELOAD=libk2_ota_shim.so over real stock libcurl.so.4.
+_img_payload = b"K2MAINLINE_OTA_PAYLOAD_" * 16384
+_img_name = "CR0CN240110C10_ota_img_V1.1.4.952.img"
+_img_sha = _hl.sha256(_img_payload).hexdigest()
+_img_crc = str(_ota_mod.crc64_ecma_bytes(_img_payload))
+_corrupt_mode = [False]
+
+class _MockGitHubHandler(_hs.BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        pass
+    def do_GET(self):
+        if self.path == "/manifest.json":
+            body = json.dumps({
+                "schema_version": 1,
+                "version": "1.1.4.952",
+                "tag": "v1.1.4.952",
+                "repo": "supfeer/k2-mainline",
+                "board": "CR0CN240110C10",
+                "model": "F008",
+                "filename": _img_name,
+                "size": len(_img_payload),
+                "sha256": _img_sha,
+                "crc64ecma": _img_crc,
+                "download_url": f"http://127.0.0.1:{self.server.server_port}/assets/{_img_name}",
+                "release_notes": ["K2 Mainline v1.1.4.952"],
+            }).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == f"/assets/{_img_name}":
+            data = bytearray(_img_payload)
+            if _corrupt_mode[0]:
+                data[128] ^= 0xFF
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(bytes(data))
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+_gh_srv = _hs.ThreadingHTTPServer(("127.0.0.1", 0), _MockGitHubHandler)
+_gh_thr = _thr.Thread(target=_gh_srv.serve_forever, daemon=True)
+_gh_thr.start()
+_ota_srv = _ota_mod.make_proxy_server({
+    "enabled": True,
+    "repo": "supfeer/k2-mainline",
+    "manifest_url": f"http://127.0.0.1:{_gh_srv.server_port}/manifest.json",
+    "listen_host": "127.0.0.1",
+    "listen_port": 0,
+    "cache_ttl": 60,
+    "allow_http": True,
+})
+_ota_thr = _thr.Thread(target=_ota_srv.serve_forever, daemon=True)
+_ota_thr.start()
+try:
+    _proxy_port = _ota_srv.server_port
+    _proxy_endpoint = f"http://127.0.0.1:{_proxy_port}/api/cxy/v2/firmware/list"
+
+    # Spawn a subprocess with LD_PRELOAD=/usr/lib/libk2_ota_shim.so calling real /usr/lib/libcurl.so.4
+    # via RTLD_DEFAULT (matching PLT resolution in libcrealitycloud.so) against Creality Cloud URL.
+    _shim_check_code = r'''
+import ctypes, json
+curl = ctypes.CDLL("/usr/lib/libcurl.so.4", mode=ctypes.RTLD_GLOBAL)
+default_syms = ctypes.CDLL(None)
+curl.curl_easy_init.restype = ctypes.c_void_p
+default_syms.curl_easy_setopt.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+default_syms.curl_easy_setopt.restype = ctypes.c_int
+curl.curl_easy_perform.argtypes = [ctypes.c_void_p]
+curl.curl_easy_perform.restype = ctypes.c_int
+curl.curl_easy_cleanup.argtypes = [ctypes.c_void_p]
+
+WRITEFUNC = ctypes.CFUNCTYPE(ctypes.c_size_t, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_void_p)
+def post_via_libcurl(url, body_bytes):
+    buf = bytearray()
+    @WRITEFUNC
+    def _wcb(ptr, size, nmemb, userdata):
+        n = size * nmemb
+        buf.extend(ctypes.string_at(ptr, n))
+        return n
+    h = curl.curl_easy_init()
+    assert h, "curl_easy_init failed"
+    try:
+        # CURLOPT_URL=10002, CURLOPT_POSTFIELDS=10015, CURLOPT_POSTFIELDSIZE=60, CURLOPT_WRITEFUNCTION=20011
+        assert default_syms.curl_easy_setopt(h, 10002, ctypes.c_char_p(url.encode("ascii"))) == 0
+        assert default_syms.curl_easy_setopt(h, 10015, ctypes.c_char_p(body_bytes)) == 0
+        assert default_syms.curl_easy_setopt(h, 60, ctypes.c_void_p(len(body_bytes))) == 0
+        assert default_syms.curl_easy_setopt(h, 20011, ctypes.cast(_wcb, ctypes.c_void_p)) == 0
+        rc = curl.curl_easy_perform(h)
+        assert rc == 0, f"curl_easy_perform failed: {rc}"
+    finally:
+        curl.curl_easy_cleanup(h)
+    return json.loads(buf.decode("utf-8"))
+
+sys_resp = post_via_libcurl(
+    "https://api.crealitycloud.com/api/cxy/v2/firmware/list",
+    json.dumps({"items": [{"type": 2, "subType": "F008", "firmwareVersion": "1.1.4.950", "hardwareVersionNumber": "CR0CN240110C10"}]}).encode("utf-8"),
+)
+assert sys_resp["code"] == 0 and sys_resp["msg"] == "ok" and sys_resp["result"]["count"] == 1, sys_resp
+item = sys_resp["result"]["list"][0]
+assert item["versionNumber"] == "1.1.4.952", item
+assert item["downloadUrl"].endswith("/download/CR0CN240110C10_ota_img_V1.1.4.952.img"), item
+
+cfs_resp = post_via_libcurl(
+    "https://api.crealitycloud.com/api/cxy/v2/firmware/list",
+    json.dumps({"items": [{"type": 27, "subType": "cfs", "firmwareVersion": "1.1.3", "hardwareVersionNumber": ""}]}).encode("utf-8"),
+)
+assert cfs_resp["code"] == 0 and cfs_resp["result"]["count"] == 0 and cfs_resp["result"]["list"] == [], cfs_resp
+print(item["downloadUrl"])
+'''
+    _shim_env = {
+        **os.environ,
+        "LD_PRELOAD": "/usr/lib/libk2_ota_shim.so",
+        "K2_OTA_PROXY_URL": _proxy_endpoint,
+    }
+    _dl_url = subprocess.check_output(
+        ["/usr/share/klippy-env/bin/python", "-B", "-c", _shim_check_code],
+        env=_shim_env,
+        text=True,
+    ).strip()
+
+    # Verify streamed download headers (Content-Disposition + x-oss-hash-crc64ecma) and exact bytes.
+    with _ureq.urlopen(_dl_url, timeout=10.0) as _r:
+        _disp = _r.headers.get("Content-Disposition", "")
+        _hdr_crc = _r.headers.get("x-oss-hash-crc64ecma", "")
+        _got_bytes = _r.read()
+    if f'attachment;filename="{_img_name}"' not in _disp:
+        raise AssertionError(f"Unexpected Content-Disposition header: {_disp!r}")
+    if _hdr_crc != _img_crc:
+        raise AssertionError(f"Unexpected x-oss-hash-crc64ecma header: {_hdr_crc!r} != {_img_crc!r}")
+    if _got_bytes != _img_payload:
+        raise AssertionError("Downloaded image payload mismatch")
+
+    # Verify corrupted upstream payload is aborted before Content-Length completes.
+    _corrupt_mode[0] = True
+    try:
+        with _ureq.urlopen(_dl_url, timeout=10.0) as _r_bad:
+            _bad_bytes = _r_bad.read()
+        if len(_bad_bytes) == len(_img_payload):
+            raise AssertionError("Proxy delivered full corrupted payload instead of aborting")
+    except Exception:
+        pass
+finally:
+    _ota_srv.shutdown()
+    _ota_srv.server_close()
+    _gh_srv.shutdown()
+    _gh_srv.server_close()
+
 result = {
     "api_version": mserver.API_VERSION_STRING if hasattr(mserver, "API_VERSION_STRING") else ".".join(map(str, mserver.API_VERSION)),
     "moonraker_version": mver.__version__,
@@ -1814,6 +2004,9 @@ result = {
     "go2rtc_config_ok": True,
     "go2rtc_init_ok": True,
     "k2_h264_source_ok": True,
+    "k2_ota_proxy_verified": True,
+    "k2_ota_shim_libcurl_verified": True,
+    "k2_ota_crc64_parity_verified": True,
     "fluidd_version": fluidd_rel["version"],
     "mainsail_version": mainsail_rel["version"],
     "nginx_config_ok": True,
@@ -1890,6 +2083,20 @@ def main() -> int:
             go2rtc_init_dst = chroot_root / "etc/init.d/go2rtc"
             shutil.copy2(K2_SERVICES_SRC / "init_go2rtc", go2rtc_init_dst)
             go2rtc_init_dst.chmod(0o755)
+            ota_shim_dst = chroot_root / "usr/lib/libk2_ota_shim.so"
+            shutil.copy2(NATIVE_DIR / "libk2_ota_shim.so", ota_shim_dst)
+            ota_shim_dst.chmod(0o755)
+            ota_cli_dst = chroot_root / "usr/bin/k2-ota-update"
+            shutil.copy2(K2_SERVICES_SRC / "k2_ota_update.py", ota_cli_dst)
+            ota_cli_dst.chmod(0o755)
+            ota_init_dst = chroot_root / "etc/init.d/k2_ota_proxy"
+            shutil.copy2(K2_SERVICES_SRC / "init_k2_ota_proxy", ota_init_dst)
+            ota_init_dst.chmod(0o755)
+            sys.path.insert(0, "/src/k2_mainline/ota")
+            from init_patches import patch_app_init  # noqa: E402
+            app_init_dst = chroot_root / "etc/init.d/app"
+            app_init_dst.write_text(patch_app_init(app_init_dst.read_text(encoding="utf-8")), encoding="utf-8")
+            app_init_dst.chmod(0o755)
 
             subprocess.run(
                 [

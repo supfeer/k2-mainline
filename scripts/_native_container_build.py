@@ -168,6 +168,141 @@ def build_and_verify_k2_hardware() -> tuple[Path, dict]:
     }
 
 
+def build_and_verify_k2_ota_shim() -> tuple[Path, dict]:
+    """Compile libk2_ota_shim.so and verify strict single-symbol export and ARMv7 ABI."""
+    print("=== Building libk2_ota_shim.so ===", flush=True)
+    native_dir = SRC_MAINLINE / "native"
+    out_so = OUT_DIR / "libk2_ota_shim.so"
+
+    run(
+        [
+            "gcc",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-O2",
+            "-fPIC",
+            "-shared",
+            "-Wl,--no-undefined",
+            f"-Wl,--version-script={native_dir / 'k2_ota_shim.map'}",
+            str(native_dir / "k2_ota_shim.c"),
+            "-ldl",
+            "-o",
+            str(out_so),
+        ]
+    )
+
+    nm_out = subprocess.check_output(
+        ["nm", "-D", "--defined-only", str(out_so)], text=True
+    )
+    exported: list[str] = []
+    for line in nm_out.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[1] in ("T", "D", "R", "B"):
+            exported.append(parts[2])
+    exported_sorted = sorted(exported)
+    assert exported_sorted == ["curl_easy_setopt"], (
+        f"Unexpected exports in libk2_ota_shim.so: {exported_sorted}"
+    )
+
+    # Compile and execute a standalone ARMv7 interposition test verifying CURLOPT_URL rewrite
+    # and 64-bit CURLOPT_OFF_T forwarding through dlsym(RTLD_NEXT, ...).
+    test_dir = Path("/work/ota-shim-test")
+    if test_dir.exists():
+        shutil.rmtree(test_dir)
+    test_dir.mkdir(parents=True)
+    fake_curl_c = test_dir / "fake_curl.c"
+    fake_curl_c.write_text(
+        """
+#include <stdarg.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+static char last_url[256];
+static int64_t last_off64 = 0;
+
+int curl_easy_setopt(void *curl, int option, ...) {
+    (void)curl;
+    va_list ap;
+    va_start(ap, option);
+    if (option >= 30000 && option <= 39999) {
+        last_off64 = va_arg(ap, int64_t);
+        va_end(ap);
+        return 0;
+    }
+    void *arg = va_arg(ap, void *);
+    va_end(ap);
+    if (option == 10002 && arg != NULL) {
+        snprintf(last_url, sizeof(last_url), "%s", (const char *)arg);
+    }
+    return 0;
+}
+
+const char *fake_last_url(void) { return last_url; }
+int64_t fake_last_off64(void) { return last_off64; }
+""",
+        encoding="utf-8",
+    )
+    fake_curl_so = test_dir / "libfakecurl.so"
+    run(["gcc", "-O2", "-fPIC", "-shared", str(fake_curl_c), "-o", str(fake_curl_so)])
+
+    harness_c = test_dir / "harness.c"
+    harness_c.write_text(
+        """
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+extern int curl_easy_setopt(void *curl, int option, ...);
+extern const char *fake_last_url(void);
+extern int64_t fake_last_off64(void);
+
+int main(void) {
+    int rc = curl_easy_setopt(NULL, 10002, "https://api.crealitycloud.com/api/cxy/v2/firmware/list");
+    if (rc != 0 || strcmp(fake_last_url(), "http://127.0.0.1:7129/api/cxy/v2/firmware/list") != 0) {
+        fprintf(stderr, "FAIL rewrite: rc=%d url=%s\\n", rc, fake_last_url());
+        return 1;
+    }
+    rc = curl_easy_setopt(NULL, 10002, "https://api.crealitycloud.com/api/cxy/v2/device/report");
+    if (rc != 0 || strcmp(fake_last_url(), "https://api.crealitycloud.com/api/cxy/v2/device/report") != 0) {
+        fprintf(stderr, "FAIL passthrough: rc=%d url=%s\\n", rc, fake_last_url());
+        return 2;
+    }
+    int64_t big = 0x123456789ABCDEF0LL;
+    rc = curl_easy_setopt(NULL, 30116, big);
+    if (rc != 0 || fake_last_off64() != big) {
+        fprintf(stderr, "FAIL off64: rc=%d got=0x%llx\\n", rc, (unsigned long long)fake_last_off64());
+        return 3;
+    }
+    return 0;
+}
+""",
+        encoding="utf-8",
+    )
+    harness_bin = test_dir / "harness"
+    run(
+        [
+            "gcc",
+            "-O2",
+            str(harness_c),
+            f"-L{test_dir}",
+            "-lfakecurl",
+            f"-Wl,-rpath,{test_dir}",
+            "-o",
+            str(harness_bin),
+        ]
+    )
+    env = os.environ.copy()
+    env["LD_PRELOAD"] = str(out_so)
+    subprocess.run([str(harness_bin)], env=env, check=True)
+
+    return out_so, {
+        "exported_symbols": exported_sorted,
+        "interposition_selftest": "passed",
+    }
+
+
 def build_klipper_mcu() -> Path:
     """Compile upstream Klipper Linux host MCU daemon (klipper_mcu)."""
     print("=== Building klipper_mcu (src/linux) ===", flush=True)
@@ -252,11 +387,13 @@ def main() -> int:
 
     c_helper = build_c_helper()
     k2_hw, abi_info = build_and_verify_k2_hardware()
+    k2_ota_shim, ota_shim_info = build_and_verify_k2_ota_shim()
     klipper_mcu = build_klipper_mcu()
 
     elfs = {
         "c_helper.so": check_elf_abi(c_helper, require_interp=None),
         "k2_hardware.so": check_elf_abi(k2_hw, require_interp=None),
+        "libk2_ota_shim.so": check_elf_abi(k2_ota_shim, require_interp=None),
         "klipper_mcu": check_elf_abi(
             klipper_mcu, require_interp="/lib/ld-linux-armhf.so.3"
         ),
@@ -272,6 +409,7 @@ def main() -> int:
         "glibc_container": ldd_ver,
         "python_check": py_info,
         "k2_hardware_abi": abi_info,
+        "k2_ota_shim_abi": ota_shim_info,
         "artifacts": elfs,
     }
     report_path = OUT_DIR / "build_native_report.json"

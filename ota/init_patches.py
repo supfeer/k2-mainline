@@ -453,3 +453,33 @@ def patch_moonraker_init(original: str) -> str:
         if anchor not in original:
             raise ValueError(f"Expected stock moonraker init anchor missing: {anchor!r}")
     return _UPSTREAM_MOONRAKER_INIT_SCRIPT
+
+
+_APP_ENV_ANCHOR = "    procd_set_param env HOME=/root\n"
+_APP_ENV_REPLACEMENT = (
+    '    if [ "$app" = "$BIN_PATH/$APP_SERVER" ] && [ -r /usr/lib/libk2_ota_shim.so ]; then\n'
+    "        procd_set_param env HOME=/root LD_PRELOAD=/usr/lib/libk2_ota_shim.so\n"
+    "    else\n"
+    "        procd_set_param env HOME=/root\n"
+    "    fi\n"
+)
+
+
+def patch_app_init(original: str) -> str:
+    """Load libk2_ota_shim.so strictly for app-server so screen OTA checks hit k2-ota-proxy."""
+    required_anchors = (
+        "APP_SERVER=app-server",
+        "BIN_PATH=/usr/bin",
+        "start_app() {",
+        "procd_set_param command $app",
+    )
+    for anchor in required_anchors:
+        if anchor not in original:
+            raise ValueError(f"Expected stock app init anchor missing: {anchor!r}")
+    if "LD_PRELOAD=/usr/lib/libk2_ota_shim.so" in original:
+        return original
+    if original.count(_APP_ENV_ANCHOR) != 1:
+        raise ValueError(
+            f"Expected single procd env line in etc/init.d/app, found {original.count(_APP_ENV_ANCHOR)}"
+        )
+    return original.replace(_APP_ENV_ANCHOR, _APP_ENV_REPLACEMENT, 1)

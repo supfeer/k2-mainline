@@ -175,6 +175,7 @@ def verify_host_arm() -> Path:
     klippy_dir = out_host / "klippy"
     inv_path = out_host / "inventory.json"
     out_mcu = build_root / "out" / "mcu"
+    out_native = build_root / "out" / "native"
     out_services = build_root / "out" / "services"
 
     if not (klippy_dir / "klippy.py").is_file() or not inv_path.is_file():
@@ -184,6 +185,10 @@ def verify_host_arm() -> Path:
     if not (out_mcu / "main_klipper.dict").is_file() or not (out_mcu / "nozzle_klipper.dict").is_file():
         raise FileNotFoundError(
             f"Missing MCU dictionaries in {out_mcu}; run build_mcu.py first"
+        )
+    if not (out_native / "libk2_ota_shim.so").is_file():
+        raise FileNotFoundError(
+            f"Missing native OTA shim in {out_native}; run build_native.py first"
         )
     if not (out_services / "build_services_report.json").is_file():
         raise FileNotFoundError(
@@ -215,6 +220,8 @@ def verify_host_arm() -> Path:
                 f"{klippy_dir}:/src/klippy:ro",
                 "-v",
                 f"{out_mcu}:/src/mcu:ro",
+                "-v",
+                f"{out_native}:/src/native:ro",
                 "-v",
                 f"{out_services}:/src/services:ro",
                 "-v",

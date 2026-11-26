@@ -93,9 +93,10 @@ def build_ota(
         raise RuntimeError("Refusing OTA build: verify_host_arm_report.json did not pass")
 
     klipper_mcu = out_native / "klipper_mcu"
+    ota_shim = out_native / "libk2_ota_shim.so"
     main_fw = out_mcu / MAIN_FW_BIN
     nozzle_fw = out_mcu / NOZZLE_FW_BIN
-    for req in (klipper_mcu, main_fw, nozzle_fw):
+    for req in (klipper_mcu, ota_shim, main_fw, nozzle_fw):
         if not req.is_file():
             raise FileNotFoundError(f"Missing build artifact {req}")
 

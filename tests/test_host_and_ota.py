@@ -28,11 +28,15 @@ from common import (  # noqa: E402
 from cpio_crc import mapped_cpio_crc, read_cpio_crc, write_cpio_crc  # noqa: E402
 from fetch_sources import extract_klipper  # noqa: E402
 from init_patches import (  # noqa: E402
+    patch_app_init,
     patch_klipper_init,
     patch_klipper_mcu_init,
     patch_mcu_update_init,
     patch_moonraker_init,
 )
+sys.path.insert(0, str(K2_MAINLINE_DIR / "services"))
+import k2_ota_update  # noqa: E402
+import publish_github_release  # noqa: E402
 import k2_sync_config  # noqa: E402
 from sw_description import FORBIDDEN_TOKENS, render_sw_description  # noqa: E402
 
@@ -150,6 +154,9 @@ class HostAndConfigTests(unittest.TestCase):
         self.assertTrue(svc["go2rtc_config_ok"])
         self.assertTrue(svc["go2rtc_init_ok"])
         self.assertTrue(svc["k2_h264_source_ok"])
+        self.assertTrue(svc["k2_ota_proxy_verified"])
+        self.assertTrue(svc["k2_ota_shim_libcurl_verified"])
+        self.assertTrue(svc["k2_ota_crc64_parity_verified"])
         self.assertTrue(svc["nginx_config_ok"])
         self.assertTrue(svc["openwrt_provider_verified"])
         self.assertTrue(svc["lmdb_migration_verified"])
@@ -214,6 +221,7 @@ class HostAndConfigTests(unittest.TestCase):
         self.assertIn("snapshot_url: /webcam/api/frame.jpeg?src=k2", mr_conf)
         mr_asvc = (K2_MAINLINE_DIR / "services" / "moonraker.asvc").read_text(encoding="utf-8")
         self.assertIn("go2rtc", mr_asvc.splitlines())
+        self.assertIn("k2_ota_proxy", mr_asvc.splitlines())
         nginx_conf = (K2_MAINLINE_DIR / "services" / "nginx.conf").read_text(encoding="utf-8")
         self.assertIn("proxy_pass http://go2rtc/;", nginx_conf)
         self.assertIn("proxy_pass http://webrtc_camera/call/;", nginx_conf)
@@ -413,6 +421,64 @@ class OtaPackagingTests(unittest.TestCase):
             patched_moon_init,
         )
 
+        stock_app_init = (
+            "#!/bin/sh /etc/rc.common\n"
+            "BIN_PATH=/usr/bin\n"
+            "APP_SERVER=app-server\n"
+            "start_app() {\n"
+            "    local app=$1\n"
+            "    procd_open_instance\n"
+            "    procd_set_param env HOME=/root\n"
+            "    procd_set_param command $app\n"
+            "    procd_close_instance\n"
+            "}\n"
+        )
+        patched_app = patch_app_init(stock_app_init)
+        self.assertIn('if [ "$app" = "$BIN_PATH/$APP_SERVER" ]', patched_app)
+        self.assertIn("LD_PRELOAD=/usr/lib/libk2_ota_shim.so", patched_app)
+        self.assertEqual(patch_app_init(patched_app), patched_app)
+
+    def test_github_ota_manifest_and_release_bundle(self) -> None:
+        self.assertEqual(k2_ota_update.crc64_ecma_bytes(b"123456789"), 0x995DC9BBDF1939FA)
+        self.assertTrue(k2_ota_update.is_newer_version("1.1.4.952", "1.1.4.950"))
+        self.assertTrue(k2_ota_update.is_newer_version("1.1.4.950", "1.1.4.11"))
+        self.assertFalse(k2_ota_update.is_newer_version("1.1.4.950", "1.1.4.950"))
+        self.assertFalse(k2_ota_update.is_newer_version("1.1.4.950", "1.1.4.952"))
+
+        with tempfile.TemporaryDirectory() as td:
+            tdp = Path(td)
+            fake_img = tdp / "CR0CN240110C10_ota_img_V1.1.4.952.img"
+            fake_img.write_bytes(b"TEST_K2_OTA_IMAGE_DATA" * 64)
+            fake_report = {"version": "1.1.4.952", "passed": True}
+            manifest_obj, manifest_path, sums_path = publish_github_release.build_release_bundle(
+                img_path=fake_img,
+                report=fake_report,
+                repo="supfeer/k2-mainline",
+                tag="v1.1.4.952",
+                notes=["K2 Mainline v1.1.4.952"],
+                out_dir=tdp / "bundle",
+            )
+            self.assertTrue(manifest_path.is_file())
+            self.assertTrue(sums_path.is_file())
+            self.assertEqual(manifest_obj["version"], "1.1.4.952")
+            self.assertIn(manifest_obj["sha256"], sums_path.read_text(encoding="utf-8"))
+
+            resp_sys = k2_ota_update.build_creality_firmware_response(
+                {"items": [{"type": 2, "subType": "F008", "firmwareVersion": "1.1.4.950", "hardwareVersionNumber": "CR0CN240110C10"}]},
+                manifest_obj,
+                proxy_base_url="http://127.0.0.1:7129",
+            )
+            self.assertEqual(resp_sys["result"]["count"], 1)
+            self.assertEqual(resp_sys["result"]["list"][0]["versionNumber"], "1.1.4.952")
+
+            resp_cfs = k2_ota_update.build_creality_firmware_response(
+                {"items": [{"type": 27, "subType": "cfs", "firmwareVersion": "1.1.3", "hardwareVersionNumber": ""}]},
+                manifest_obj,
+                proxy_base_url="http://127.0.0.1:7129",
+            )
+            self.assertEqual(resp_cfs["result"]["count"], 0)
+            self.assertEqual(resp_cfs["result"]["list"], [])
+
     def test_ota_image_and_verification_report(self) -> None:
         out_ota = self.build_root / "out" / "ota"
         report_path = out_ota / "ota_verification_report.json"
@@ -440,7 +506,7 @@ class OtaPackagingTests(unittest.TestCase):
             "usr/bin/webrtc",
             "usr/bin/webrtc_local",
             "usr/bin/cam_app",
-            "etc/init.d/app",
+            "usr/share/k2-ota/app.init.stock",
         ):
             self.assertIn(cloud_rel, pack["preserved_pins"])
         changed_paths = set(pack["changed_rootfs_paths"])
@@ -450,6 +516,12 @@ class OtaPackagingTests(unittest.TestCase):
             "etc/go2rtc/go2rtc.yaml",
             "etc/init.d/go2rtc",
             "etc/rc.d/S98go2rtc",
+            "usr/lib/libk2_ota_shim.so",
+            "usr/bin/k2-ota-update",
+            "etc/init.d/k2_ota_proxy",
+            "etc/rc.d/S97k2_ota_proxy",
+            "etc/init.d/app",
+            "usr/share/k2-ota/app.init.stock",
         ):
             self.assertIn(go2rtc_rel, changed_paths)
         self.assertEqual(pack["klippy_bytecode_artifacts"], 0)

@@ -1,0 +1,1 @@
+{ global: curl_easy_setopt; local: *; };

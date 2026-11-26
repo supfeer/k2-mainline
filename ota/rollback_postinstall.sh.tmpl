@@ -49,6 +49,7 @@ for parent in \
     etc/rc.d \
     usr \
     usr/bin \
+    usr/lib \
     usr/share \
     usr/share/klipper \
     usr/share/klipper/klippy \
@@ -73,17 +74,22 @@ done
 
 for item in \
     etc/go2rtc/go2rtc.yaml \
+    etc/init.d/app \
     etc/init.d/go2rtc \
+    etc/init.d/k2_ota_proxy \
     etc/init.d/klipper \
     etc/init.d/klipper_mcu \
     etc/init.d/mcu_update \
     etc/init.d/moonraker \
     etc/nginx/nginx.conf \
+    etc/rc.d/S97k2_ota_proxy \
     etc/rc.d/S98go2rtc \
     usr/bin/klipper_mcu \
     usr/bin/curl \
     usr/bin/go2rtc \
+    usr/bin/k2-ota-update \
     usr/bin/k2_h264_source \
+    usr/lib/libk2_ota_shim.so \
     usr/share/klipper/config/k2_sync_config.py
 do
     shadow="/overlay/upper/$item"
@@ -369,17 +375,22 @@ fi
 stage_idx=0
 for item in \
     etc/go2rtc/go2rtc.yaml \
+    etc/init.d/app \
     etc/init.d/go2rtc \
+    etc/init.d/k2_ota_proxy \
     etc/init.d/klipper \
     etc/init.d/klipper_mcu \
     etc/init.d/mcu_update \
     etc/init.d/moonraker \
     etc/nginx/nginx.conf \
+    etc/rc.d/S97k2_ota_proxy \
     etc/rc.d/S98go2rtc \
     usr/bin/klipper_mcu \
     usr/bin/curl \
     usr/bin/go2rtc \
+    usr/bin/k2-ota-update \
     usr/bin/k2_h264_source \
+    usr/lib/libk2_ota_shim.so \
     usr/share/klipper/config/k2_sync_config.py
 do
     shadow="/overlay/upper/$item"
