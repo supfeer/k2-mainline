@@ -34,7 +34,7 @@ DEFAULT_KLIPPY_UDS = Path("/tmp/klippy_uds")
 
 # Tail bytes held back during streaming until SHA-256 and CRC64-ECMA match manifest.
 VERIFY_TAIL_BYTES = 64
-STREAM_CHUNK_BYTES = 64 * 1024
+STREAM_CHUNK_BYTES = 256 * 1024
 MIN_EXTRA_FREE_BYTES = 512 * 1024 * 1024
 
 _FILENAME_RE = re.compile(r"^CR0CN240110C10_ota_img_V(\d+\.\d+\.\d+\.\d+)\.img$")
@@ -362,15 +362,13 @@ def download_and_verify_image(
     # Reuse already verified image if present.
     if final_path.is_file() and final_path.stat().st_size == manifest["size"]:
         h_exist = hashlib.sha256()
-        crc_exist = 0
         with final_path.open("rb") as fh:
             while True:
                 chunk = fh.read(256 * 1024)
                 if not chunk:
                     break
                 h_exist.update(chunk)
-                crc_exist = crc64_ecma_update(crc_exist, chunk)
-        if h_exist.hexdigest() == manifest["sha256"] and str(crc_exist) == manifest["crc64ecma"]:
+        if h_exist.hexdigest() == manifest["sha256"]:
             return final_path
 
     st = os.statvfs(str(dest_dir))
@@ -386,7 +384,6 @@ def download_and_verify_image(
     ctx = _ssl_context() if url.startswith("https://") else None
 
     sha = hashlib.sha256()
-    crc = 0
     total = 0
     try:
         with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp, tmp_path.open("wb") as out:
@@ -401,7 +398,6 @@ def download_and_verify_image(
                     )
                 out.write(chunk)
                 sha.update(chunk)
-                crc = crc64_ecma_update(crc, chunk)
             out.flush()
             os.fsync(out.fileno())
 
@@ -410,10 +406,6 @@ def download_and_verify_image(
         if sha.hexdigest() != manifest["sha256"]:
             raise RuntimeError(
                 f"SHA-256 mismatch: got {sha.hexdigest()}, expected {manifest['sha256']}"
-            )
-        if str(crc) != manifest["crc64ecma"]:
-            raise RuntimeError(
-                f"CRC64-ECMA mismatch: got {crc}, expected {manifest['crc64ecma']}"
             )
         os.replace(tmp_path, final_path)
         return final_path
@@ -638,12 +630,13 @@ def make_proxy_server(cfg: dict[str, Any]) -> http.server.ThreadingHTTPServer:
                 self.end_headers()
 
                 sha = hashlib.sha256()
-                crc = 0
                 total = 0
                 tail = bytearray()
 
                 # Hold back the last VERIFY_TAIL_BYTES bytes until EOF so a SHA-256 mismatch
-                # aborts the HTTP transfer before Content-Length completes.
+                # aborts the HTTP transfer before Content-Length completes. SHA-256 is verified
+                # in C (OpenSSL) at wire speed; libcrealitycloud.so additionally verifies
+                # x-oss-hash-crc64ecma in native C++ after download completes.
                 while True:
                     chunk = upstream.read(STREAM_CHUNK_BYTES)
                     if not chunk:
@@ -658,7 +651,6 @@ def make_proxy_server(cfg: dict[str, Any]) -> http.server.ThreadingHTTPServer:
                         self.close_connection = True
                         return
                     sha.update(chunk)
-                    crc = crc64_ecma_update(crc, chunk)
                     tail.extend(chunk)
                     if len(tail) > VERIFY_TAIL_BYTES:
                         emit = bytes(tail[:-VERIFY_TAIL_BYTES])
@@ -669,19 +661,13 @@ def make_proxy_server(cfg: dict[str, Any]) -> http.server.ThreadingHTTPServer:
                             self.close_connection = True
                             return
 
-                if (
-                    total != expected_size
-                    or sha.hexdigest() != manifest["sha256"]
-                    or str(crc) != manifest["crc64ecma"]
-                ):
+                if total != expected_size or sha.hexdigest() != manifest["sha256"]:
                     self.log_message(
-                        "aborting stream on integrity mismatch: size=%d/%d sha=%s/%s crc=%d/%s",
+                        "aborting stream on integrity mismatch: size=%d/%d sha=%s/%s",
                         total,
                         expected_size,
                         sha.hexdigest(),
                         manifest["sha256"],
-                        crc,
-                        manifest["crc64ecma"],
                     )
                     self.close_connection = True
                     return
@@ -749,7 +735,7 @@ def cmd_apply(
         upgrade_dir,
         allow_http=bool(cfg["allow_http"]),
     )
-    print(f"Verified SHA-256 ({manifest['sha256']}) and CRC64-ECMA ({manifest['crc64ecma']}).")
+    print(f"Verified SHA-256 ({manifest['sha256']}).")
 
     if not local_ota_bin.is_file():
         raise FileNotFoundError(f"Missing OTA installer script: {local_ota_bin}")
