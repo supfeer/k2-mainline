@@ -357,7 +357,7 @@ def download_and_verify_image(
     """Download .img to temporary path, verify exact size, SHA-256, and CRC64-ECMA, then rename."""
     dest_dir.mkdir(parents=True, exist_ok=True)
     final_path = dest_dir / manifest["filename"]
-    tmp_path = dest_dir / f".{manifest['filename']}.part"
+    tmp_path = dest_dir / f".{manifest['filename']}.{os.getpid()}.part"
 
     # Reuse already verified image if present.
     if final_path.is_file() and final_path.stat().st_size == manifest["size"]:
@@ -740,12 +740,29 @@ def cmd_apply(
     if not local_ota_bin.is_file():
         raise FileNotFoundError(f"Missing OTA installer script: {local_ota_bin}")
 
-    print(f"Installing {img_path} via {local_ota_bin}...")
-    proc = subprocess.run([str(local_ota_bin), str(img_path)], check=False)
-    if proc.returncode != 0:
-        raise RuntimeError(f"{local_ota_bin} exited with status {proc.returncode}")
+    print(f"Installing {img_path} via {local_ota_bin}...", flush=True)
+    proc = subprocess.run(
+        [str(local_ota_bin), str(img_path)],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+    if proc.stdout:
+        sys.stdout.write(proc.stdout)
+        sys.stdout.flush()
+    # Stock /sbin/swupdate_cmd.sh exits 0 even after retries fail; it prints "ota update ok"
+    # strictly on verified SWUpdate + postinstall completion (same marker checked by upgrade-server).
+    if proc.returncode != 0 or "ota update ok" not in (proc.stdout or ""):
+        swu_log = Path("/mnt/UDISK/swupdate.log")
+        if swu_log.is_file():
+            tail_lines = swu_log.read_text(encoding="utf-8", errors="replace").splitlines()[-20:]
+            sys.stderr.write("Last lines of /mnt/UDISK/swupdate.log:\n" + "\n".join(tail_lines) + "\n")
+        raise RuntimeError(
+            f"{local_ota_bin} failed (rc={proc.returncode}, missing 'ota update ok' confirmation)"
+        )
 
-    print("OTA update installed cleanly.")
+    print("OTA update installed cleanly.", flush=True)
     if not no_reboot:
         subprocess.run(["sync"], check=False)
         subprocess.run(["reboot"], check=False)

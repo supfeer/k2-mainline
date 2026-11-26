@@ -171,9 +171,9 @@ free_kib=$(df -Pk /mnt/UDISK | awk 'NR==2 {print $4}')
 [ -n "$free_kib" ] && [ "$free_kib" -ge 524288 ] || fail 'Insufficient persistent space on /mnt/UDISK'
 
 # Strict read-only audit of /overlay/upper before flashing; cleanup happens in postinstall.sh.
+# Shared parent directories must not be opaque whiteouts (which would hide sibling system files).
 for parent in \
     etc \
-    etc/go2rtc \
     etc/init.d \
     etc/nginx \
     etc/rc.d \
@@ -182,18 +182,11 @@ for parent in \
     usr/lib \
     usr/share \
     usr/share/klipper \
-    usr/share/klipper/klippy \
     usr/share/klipper/fw \
-    usr/share/klipper/fw/F008 \
     usr/share/klipper/config \
-    usr/share/klipper/config/F008_CR0CN240319C13 \
-    usr/share/moonraker \
     usr/share/moonraker-env \
     usr/share/moonraker-env/lib \
-    usr/share/moonraker-env/lib/python3.9 \
-    usr/share/fluidd \
-    usr/share/mainsail \
-    usr/share/k2-ota
+    usr/share/moonraker-env/lib/python3.9
 do
     ov_path="/overlay/upper/$parent"
     [ ! -L "$ov_path" ] || fail "Symlink in overlay parent path: $parent"
@@ -211,6 +204,25 @@ except OSError:
 if val == b"y":
     sys.exit(2)
 ' "$ov_path" || fail "Opaque whiteout directory in overlay path: $parent"
+    fi
+done
+
+# Managed leaf directories are removed in full by postinstall.sh, so overlayfs opaque xattr
+# on them is expected on OpenWrt and safe; still forbid symlinks and non-directory shadows.
+for leaf in \
+    etc/go2rtc \
+    usr/share/klipper/klippy \
+    usr/share/klipper/fw/F008 \
+    usr/share/klipper/config/F008_CR0CN240319C13 \
+    usr/share/moonraker \
+    usr/share/fluidd \
+    usr/share/mainsail \
+    usr/share/k2-ota
+do
+    ov_path="/overlay/upper/$leaf"
+    [ ! -L "$ov_path" ] || fail "Symlink in overlay managed tree: $leaf"
+    if [ -e "$ov_path" ] && [ ! -d "$ov_path" ]; then
+        fail "Expected directory in overlay managed tree: $leaf"
     fi
 done
 
