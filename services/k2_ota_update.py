@@ -475,7 +475,13 @@ def build_creality_firmware_response(
             continue
         if hw_ver and hw_ver != manifest["board"]:
             continue
-        matched_current = str(item.get("firmwareVersion", "")).strip() or fallback_current_version
+        req_ver = str(item.get("firmwareVersion", "")).strip()
+        effective = req_ver
+        if fallback_current_version and (
+            not effective or is_newer_version(fallback_current_version, effective)
+        ):
+            effective = fallback_current_version
+        matched_current = effective
         break
 
     if matched_current is None:

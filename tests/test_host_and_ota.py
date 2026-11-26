@@ -471,6 +471,16 @@ class OtaPackagingTests(unittest.TestCase):
             self.assertEqual(resp_sys["result"]["count"], 1)
             self.assertEqual(resp_sys["result"]["list"][0]["versionNumber"], "1.1.4.952")
 
+            # Stale system_version.json (1.1.4.11) must not re-offer an already installed fw_printenv version.
+            resp_stale = k2_ota_update.build_creality_firmware_response(
+                {"items": [{"type": 2, "subType": "F008", "firmwareVersion": "1.1.4.11", "hardwareVersionNumber": "CR0CN240110C10"}]},
+                manifest_obj,
+                proxy_base_url="http://127.0.0.1:7129",
+                fallback_current_version="1.1.4.952",
+            )
+            self.assertEqual(resp_stale["result"]["count"], 0)
+            self.assertEqual(resp_stale["result"]["list"], [])
+
             resp_cfs = k2_ota_update.build_creality_firmware_response(
                 {"items": [{"type": 27, "subType": "cfs", "firmwareVersion": "1.1.3", "hardwareVersionNumber": ""}]},
                 manifest_obj,
